@@ -887,9 +887,24 @@ function renderRouting(data) {
   // 候选池：每个模型在编队里担任什么角色（primary / critic / …）。
   const cands = (cfg.activation_preview || {}).candidates || [];
   if (cands.length) {
-    const items = cands.map((c) => `<li><span class="rt__role">${escapeHtml(c.role || "")}</span>
-      ${escapeHtml(c.model || "")}<span class="rt__dim"> @ ${escapeHtml(c.provider || "")}</span></li>`);
-    rows.push(`<div class="rt__grp">候选池<ul class="rt__list">${items.join("")}</ul></div>`);
+    // 供应商通常整池一样（都挂在同一个 KEY 上）。逐行重复 "@ tokenrhythm" 会把
+    // 最长那行挤到换行，所以一致时抽到标题里，只有混用时才逐行标注。
+    const providers = [...new Set(cands.map((c) => c.provider || "").filter(Boolean))];
+    const shared = providers.length === 1 ? providers[0] : null;
+    const items = cands.map((c) => {
+      const per = shared || !c.provider
+        ? ""
+        : `<span class="rt__dim rt__at">@ ${escapeHtml(c.provider)}</span>`;
+      return `<li>
+        <span class="rt__role">${escapeHtml(c.role || "")}</span>
+        <span class="rt__model" title="${escapeHtml(c.model || "")}">${escapeHtml(c.model || "")}</span>
+        ${per}
+      </li>`;
+    });
+    const head = shared
+      ? `候选池<span class="rt__dim"> · ${escapeHtml(shared)}</span>`
+      : "候选池";
+    rows.push(`<div class="rt__grp">${head}<ul class="rt__list rt__list--cand">${items.join("")}</ul></div>`);
   }
 
   if (decisions.length) {
@@ -900,15 +915,30 @@ function renderRouting(data) {
       const route = swapped
         ? `${escapeHtml(d.requestedModel)} <span class="rt__arrow">→</span> ${escapeHtml(d.executedModel)}`
         : escapeHtml(d.executedModel || d.model || "—");
-      const saving = d.savingsPct != null ? ` · 省 ${d.savingsPct}%` : "";
-      const fallback = d.fallbackReason ? ` · 回退 ${escapeHtml(d.fallbackReason)}` : "";
-      return `<li>
-        <span class="rt__tier">${escapeHtml(d.finalTier || "?")}</span>
-        ${route}
-        <span class="rt__dim">${when}${saving}${fallback}</span>
+      // 省钱比例右对齐成独立一列，纵向扫描比挤在时间后面快得多。
+      const saving = d.savingsPct != null
+        ? `<span class="rt__save">省 ${d.savingsPct}%</span>`
+        : "";
+      const fallback = d.fallbackReason
+        ? `<div class="rt__dim rt__fb">回退 ${escapeHtml(d.fallbackReason)}</div>`
+        : "";
+      return `<li class="rt__dec">
+        <div class="rt__dec-top">
+          <span class="rt__tier">${escapeHtml(d.finalTier || "?")}</span>
+          <span class="rt__model">${route}</span>
+        </div>
+        <div class="rt__dec-bot">
+          <span class="rt__dim">${when}</span>
+          ${saving}
+        </div>
+        ${fallback}
       </li>`;
     });
-    rows.push(`<div class="rt__grp">最近决策<ul class="rt__list">${items.join("")}</ul></div>`);
+    // 标出总条数，否则列表贴着下一个面板截断，看不出还有没有更多。
+    const more = decisions.length > items.length
+      ? `<span class="rt__dim"> · 共 ${decisions.length} 条，显示最近 ${items.length}</span>`
+      : `<span class="rt__dim"> · 共 ${decisions.length} 条</span>`;
+    rows.push(`<div class="rt__grp">最近决策${more}<ul class="rt__list rt__list--dec">${items.join("")}</ul></div>`);
   } else if (data.decisions_error) {
     rows.push(`<div class="rt__line rt__bad">决策查询失败: ${escapeHtml(data.decisions_error)}</div>`);
   }

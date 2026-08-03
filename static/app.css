@@ -723,27 +723,83 @@ textarea#msg::placeholder { color: var(--dust-dim); }
 .rt__role {
   flex: 0 0 auto;
   padding: 1px 5px;
-  font-size: 9px;
+  font-size: 10px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: var(--spec-violet);
+  /* --spec-violet 原色对深底只有 4.63:1，而徽章底还叠了 14% 同色让差距更小，
+     9px 小字撑不住。提亮到接近白紫，保留紫调但拿回余量。 */
+  color: color-mix(in oklab, var(--spec-violet) 55%, white);
   background: color-mix(in oklab, var(--spec-violet) 14%, transparent);
   border-radius: 3px;
+  /* 按最长的 AGGREGATOR 定宽并居中：徽章宽度不一致时，右边的模型名起点会
+     逐行错开，扫读时没有一条对齐的列。 */
+  min-width: 80px;
+  text-align: center;
 }
+
+/* 候选池：一行放不下就截断，别换行——换行后第二行顶到左边缘像条孤行。 */
+.rt__list--cand li { flex-wrap: nowrap; }
+.rt__model {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--pearl);
+}
+.rt__at { flex: 0 0 auto; }
+/* 最近决策：每条两行。原来条目内行距和条目间距几乎一样，扫读时分不清
+   某个时间戳属于上面还是下面那条，所以拉开间距并加一条极淡的分隔线。 */
+.rt__list--dec { gap: 0; }
+/* 必须压过 .rt__list li 的 display:flex（同特异度但它在前面），否则两个内层
+   div 会并排而不是上下堆叠，下行的 space-between 也就撑不开整行宽度。 */
+.rt__list--dec li.rt__dec {
+  display: block;
+  padding: 7px 0 7px 8px;
+  border-left: 1px solid color-mix(in oklab, var(--spec-cyan) 30%, transparent);
+  /* 0.05 和 0.10 实测在这个深底上都看不出来（截图复核两次都判定"无分隔线"）。
+     0.18 才真正可辨，同时仍然比正文淡得多，不会抢视线。 */
+  border-bottom: 1px solid rgba(255, 255, 255, 0.18);
+}
+.rt__list--dec li.rt__dec:last-child { border-bottom: none; padding-bottom: 0; }
+.rt__list--dec li.rt__dec:first-child { padding-top: 0; }
+.rt__dec-top {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+}
+/* 时间靠左、省钱比例靠右，撑成可纵向对比的一列 */
+.rt__dec-bot {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  margin-top: 3px;
+}
+.rt__save {
+  flex: 0 0 auto;
+  color: var(--ok);
+  font-variant-numeric: tabular-nums;
+}
+.rt__fb { margin-top: 3px; }
+
 /* 路由档位 c0/c1/c2 */
 .rt__tier {
   flex: 0 0 auto;
   padding: 1px 5px;
-  font-size: 9px;
+  font-size: 10px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--spec-cyan);
   background: color-mix(in oklab, var(--spec-cyan) 14%, transparent);
   border-radius: 3px;
+  /* 与候选池的角色徽章同宽，两个列表的模型名才对得上同一条竖线 */
+  min-width: 80px;
+  text-align: center;
 }
 .rt__arrow { color: var(--spec-amber); }
-/* 时间/省钱比等次要信息，比主文字淡一档（3.36:1，非正文可接受） */
-.rt__dim { color: var(--dust-dim); }
+/* 时间戳这类信息现在是独立一列的正文内容，不能再用 --dust-dim（对深底仅
+   3.17:1，低于 AA 4.5:1）。统一提到 --dust（7.22:1）。 */
+.rt__dim { color: var(--dust); }
 
 .kv { display: grid; gap: 8px; }
 .kv__row {
