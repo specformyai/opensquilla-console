@@ -271,8 +271,12 @@ class KeyStore:
     def public(self) -> list[dict[str, Any]]:
         out = []
         for k in self._data["keys"]:
-            item = {kk: vv for kk, vv in k.items() if kk != "api_key"}
+            # Never ship api_key or the web account password to the browser.
+            item = {kk: vv for kk, vv in k.items() if kk not in ("api_key", "password")}
             item["api_key_masked"] = _mask(k.get("api_key", ""))
+            # The UI only needs to know whether a password is on file, so it can
+            # enable the balance button and prefill the editor placeholder.
+            item["has_password"] = bool(k.get("password"))
             item["active"] = k["id"] == self._data.get("active_id")
             out.append(item)
         return out
@@ -287,6 +291,9 @@ class KeyStore:
                 "base_url": (payload.get("base_url") or "").rstrip("/"),
                 "api_key": payload.get("api_key") or "",
                 "model": payload.get("model") or "",
+                # Web-console account, only used for balance lookup.
+                "account": payload.get("account") or "",
+                "password": payload.get("password") or "",
                 "created_at": int(time.time()),
                 "last_test": None,
             }
@@ -301,12 +308,14 @@ class KeyStore:
             entry = self.raw(key_id)
             if entry is None:
                 raise KeyError(key_id)
-            for field in ("note", "provider", "base_url", "model"):
+            for field in ("note", "provider", "base_url", "model", "account"):
                 if payload.get(field) is not None:
                     entry[field] = payload[field]
-            # An empty api_key means "keep the stored secret".
+            # Empty means "keep the stored secret" — for both of these.
             if payload.get("api_key"):
                 entry["api_key"] = payload["api_key"]
+            if payload.get("password"):
+                entry["password"] = payload["password"]
             entry["base_url"] = (entry.get("base_url") or "").rstrip("/")
             self._flush()
             return entry
@@ -1001,6 +1010,11 @@ class KeyPayload(BaseModel):
     base_url: str | None = None
     api_key: str | None = None
     model: str | None = None
+    # Balance lookup needs the web account, not the API key: TokenRhythm's
+    # /api/usage-summary only accepts a session cookie and rejects Bearer keys
+    # with 401. Optional — leave blank and the balance button just won't work.
+    account: str | None = None
+    password: str | None = None
 
 
 class ChatPayload(BaseModel):
@@ -1243,6 +1257,21 @@ async def api_keys_test(key_id: str) -> JSONResponse:
     result = await probe_via_gateway(
         entry["base_url"], entry["api_key"], entry.get("model") or "", entry["provider"]
     )
+
+    # A probe validates the credential we hand it inline, which is NOT necessarily
+    # the one the gateway will use for real chat — that one lives in the gateway's
+    # own config and is only rewritten on activate. They drift apart when an
+    # upstream key is rotated after activation, and the symptom is nasty: probe
+    # passes while chat returns 401. Flag the mismatch so it is visible.
+    if result.get("ok") and store.active_id == key_id:
+        snap = link.provider_snapshot()
+        live_base = (snap.get("base_url") or "").rstrip("/")
+        want_base = (entry.get("base_url") or "").rstrip("/")
+        if live_base and want_base and live_base != want_base:
+            result["stale_activation"] = (
+                f"网关当前用的是 {live_base}，与本凭据的 {want_base} 不一致，请重新激活"
+            )
+
     await store.record_test(key_id, result)
     return JSONResponse({"ok": True, "result": result, "keys": store.public()})
 
@@ -1295,6 +1324,251 @@ async def api_chat_history(limit: int = 60) -> JSONResponse:
         "chat.history", {"sessionKey": SESSION_KEY, "limit": limit}, timeout=45
     )
     return JSONResponse(payload or {})
+
+
+@app.post("/api/chat/reset")
+async def api_chat_reset() -> JSONResponse:
+    """Actually clear the conversation on the gateway side.
+
+    The console's own "清屏" button only wipes browser DOM, so the model still
+    remembered everything. This drops the gateway's context for the session,
+    which is what starting a new conversation means.
+    """
+    # Note the param name: sessions.* RPCs take `key`, while chat.* take
+    # `sessionKey`. Passing sessionKey here fails with "params.key is required".
+    payload = await link.rpc("sessions.reset", {"key": SESSION_KEY}, timeout=30)
+    return JSONResponse({"ok": True, "result": payload or {}})
+
+
+# Balance endpoints are not part of the OpenAI-compatible spec, so every vendor
+# invents its own. The gateway has no balance RPC at all (it only tracks what it
+# spent itself), so this is a direct upstream call. Probed in order; the first
+# response that parses into a number wins.
+BALANCE_ROUTES: tuple[tuple[str, str], ...] = (
+    # OpenRouter
+    ("/key", "openrouter"),
+    ("/credits", "openrouter"),
+    # one-api / new-api / veloera family (very common for resold endpoints)
+    ("/dashboard/billing/subscription", "oneapi"),
+    ("/api/user/self", "oneapi"),
+    # SiliconFlow, DeepSeek and lookalikes
+    ("/user/info", "generic"),
+    ("/user/balance", "generic"),
+)
+
+
+def _extract_balance(shape: str, data: Any) -> dict[str, Any] | None:
+    """Pull a balance out of one of the known response shapes."""
+    if not isinstance(data, dict):
+        return None
+    d = data.get("data") if isinstance(data.get("data"), dict) else data
+
+    if shape == "openrouter":
+        # {"data": {"limit": 5, "usage": 1.2, "limit_remaining": 3.8}}
+        remaining = d.get("limit_remaining")
+        if remaining is None and d.get("limit") is not None:
+            remaining = float(d["limit"]) - float(d.get("usage") or 0)
+        if remaining is None and d.get("total_credits") is not None:
+            remaining = float(d["total_credits"]) - float(d.get("total_usage") or 0)
+        if remaining is None:
+            return None
+        return {
+            "remaining": round(float(remaining), 6),
+            "unit": "USD",
+            "used": d.get("usage") if d.get("usage") is not None else d.get("total_usage"),
+            "limit": d.get("limit") if d.get("limit") is not None else d.get("total_credits"),
+        }
+
+    if shape == "oneapi":
+        # subscription: {"hard_limit_usd": 10.5}; user/self: {"quota": 5000000}
+        if d.get("hard_limit_usd") is not None:
+            return {"remaining": round(float(d["hard_limit_usd"]), 6), "unit": "USD"}
+        if d.get("quota") is not None:
+            # one-api stores quota in units of 500000 per USD by convention.
+            quota = float(d["quota"])
+            return {
+                "remaining": round(quota / 500000, 6),
+                "unit": "USD",
+                "raw_quota": quota,
+                "used_quota": d.get("used_quota"),
+            }
+        return None
+
+    for key in ("balance", "totalBalance", "balance_infos", "remaining", "credit"):
+        if d.get(key) is not None:
+            val = d[key]
+            if isinstance(val, list) and val and isinstance(val[0], dict):
+                first = val[0]
+                amount = first.get("total_balance") or first.get("balance")
+                if amount is None:
+                    return None
+                return {"remaining": float(amount), "unit": first.get("currency") or "USD"}
+            try:
+                return {"remaining": float(val), "unit": "USD"}
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+async def tokenrhythm_balance(account: str, password: str) -> dict[str, Any]:
+    """Read the TokenRhythm wallet by logging into its web console.
+
+    Their balance lives behind the browser session, not the API key: POST
+    /api/auth/login {account, password} sets a session cookie, and only then
+    does GET /api/usage-summary answer. Presenting the API key as a Bearer token
+    returns 401 UNAUTHORIZED on every account route — verified against all four
+    of them. This is documented behaviour on their side: the FAQ says balance is
+    only visible in 用户中心, and the published API surface is just
+    /v1/{models,chat/completions,messages,embeddings}.
+
+    One wallet backs every key on the account ("同一账号下的 API Key 共享该额度"),
+    so the figure is per-account, not per-key.
+    """
+    root = "https://tokenrhythm.studio"
+    async with httpx.AsyncClient(timeout=25.0, follow_redirects=False) as client:
+        login = await client.post(
+            f"{root}/api/auth/login",
+            json={"account": account, "password": password},
+            headers={"Content-Type": "application/json"},
+        )
+        if login.status_code != 200:
+            detail = ""
+            with contextlib.suppress(Exception):
+                detail = (login.json() or {}).get("message") or ""
+            raise HTTPException(
+                status_code=502,
+                detail=f"基元律动登录失败（HTTP {login.status_code}）{detail}",
+            )
+
+        summary = await client.get(
+            f"{root}/api/usage-summary", headers={"Accept": "application/json"}
+        )
+        if summary.status_code != 200:
+            raise HTTPException(
+                status_code=502, detail=f"读取余额失败（HTTP {summary.status_code}）"
+            )
+        body = summary.json()
+
+    data = body.get("data") if isinstance(body, dict) else None
+    if not isinstance(data, dict):
+        data = body if isinstance(body, dict) else {}
+
+    balance = data.get("balanceCny")
+    available = data.get("availableBalance")
+    if balance is None and available is None:
+        raise HTTPException(status_code=502, detail="余额接口返回里没有余额字段")
+
+    out: dict[str, Any] = {
+        "ok": True,
+        "unit": data.get("currency") or "CNY",
+        "source": "tokenrhythm-web",
+        "scope": "账户级（该账号下所有 KEY 共享）",
+    }
+    if balance is not None:
+        out["remaining"] = round(float(balance), 4)
+    if available is not None:
+        out["available"] = round(float(available), 4)
+    # Extra usage figures when present — handy next to the balance.
+    for src, dst in (("totalTokens", "total_tokens"), ("totalCostCny", "cost_cny")):
+        if data.get(src) is not None:
+            out[dst] = data[src]
+    return out
+
+
+@app.get("/api/keys/{key_id}/balance")
+async def api_key_balance(key_id: str) -> JSONResponse:
+    """Best-effort upstream balance lookup for one stored credential."""
+    entry = store.raw(key_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="凭据不存在")
+
+    # TokenRhythm (基元律动) has no key-authenticated balance route at all, so it
+    # takes the web-login path when the operator has saved account credentials.
+    # Match on the base URL, not just provider: the provider field is often left
+    # at "custom" while the endpoint is still tokenrhythm.studio.
+    is_tokenrhythm = (
+        entry.get("provider") == "tokenrhythm"
+        or "tokenrhythm.studio" in (entry.get("base_url") or "").lower()
+    )
+    if is_tokenrhythm:
+        account = (entry.get("account") or "").strip()
+        password = entry.get("password") or ""
+        if not account or not password:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "基元律动不支持用 API KEY 查余额（官方只开放 models/chat/messages/"
+                    "embeddings 四个接口）。请在凭据里补填网站账号和密码，改用网页登录查询。"
+                ),
+            )
+        return JSONResponse(await tokenrhythm_balance(account, password))
+
+    base = (entry.get("base_url") or "").rstrip("/")
+    api_key = entry.get("api_key") or ""
+    if not base or not api_key:
+        raise HTTPException(status_code=400, detail="该凭据缺少 BASE URL 或 API KEY")
+
+    # /v1 suffixed bases need stripping for the vendor-specific console routes.
+    roots = [base]
+    if base.endswith("/v1"):
+        roots.append(base[: -len("/v1")])
+
+    attempts: list[dict[str, Any]] = []
+    headers = {"Authorization": f"Bearer {api_key}"}
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+        for root in roots:
+            for route, shape in BALANCE_ROUTES:
+                url = f"{root}{route}"
+                try:
+                    resp = await client.get(url, headers=headers)
+                except Exception as exc:  # noqa: BLE001 - report and keep probing
+                    attempts.append({"url": url, "error": type(exc).__name__})
+                    continue
+                rec: dict[str, Any] = {"url": url, "status": resp.status_code}
+                if resp.status_code == 200:
+                    try:
+                        parsed = _extract_balance(shape, resp.json())
+                    except Exception:  # noqa: BLE001 - non-JSON body
+                        parsed = None
+                    if parsed:
+                        return JSONResponse({
+                            "ok": True, "source": url, "shape": shape, **parsed,
+                        })
+                    rec["note"] = "200 但未能解析出余额"
+                attempts.append(rec)
+
+    return JSONResponse({
+        "ok": False,
+        "error": "该服务商未暴露可识别的余额接口",
+        "attempts": attempts,
+    })
+
+
+@app.get("/api/usage")
+async def api_usage() -> JSONResponse:
+    """Token + spend totals as the gateway accounts for them.
+
+    Note this is the gateway's own ledger, not the upstream account balance —
+    no provider-balance RPC exists (see /api/keys/{id}/balance).
+    """
+    payload = await link.rpc("usage.status", {}, timeout=25)
+    return JSONResponse(payload or {})
+
+
+@app.get("/api/routing")
+async def api_routing() -> JSONResponse:
+    """Router configuration plus the most recent per-turn routing decisions."""
+    out: dict[str, Any] = {}
+    try:
+        out["config"] = await link.rpc("models.routing.get", {}, timeout=25) or {}
+    except Exception as exc:  # noqa: BLE001 - surface partial data
+        out["config_error"] = str(exc)
+    try:
+        decisions = await link.rpc("router.decisions.list", {"limit": 12}, timeout=25) or {}
+        out["decisions"] = decisions.get("decisions") or []
+    except Exception as exc:  # noqa: BLE001 - surface partial data
+        out["decisions_error"] = str(exc)
+    return JSONResponse(out)
 
 
 @app.post("/api/gateway/reconnect")

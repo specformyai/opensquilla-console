@@ -28,7 +28,10 @@ function toast(message, kind = "info") {
   const box = el("toasts");
   const node = document.createElement("div");
   node.className = `toast toast--${kind}`;
-  const ic = kind === "ok" ? "check" : kind === "bad" ? "x" : "circle-dot";
+  const ic = kind === "ok" ? "check"
+    : kind === "bad" ? "x"
+    : kind === "warn" ? "triangle-alert"
+    : "circle-dot";
   node.innerHTML = `${icon(ic)}<div>${escapeHtml(message)}</div>`;
   box.appendChild(node);
   setTimeout(() => {
@@ -147,8 +150,10 @@ function renderGatewayCard() {
     ["测活问题", gw.probe_question || PROBE_QUESTION],
   ];
   if (gw.error) rows.push(["错误", gw.error]);
+  // 值单行省略，title 给全文，点击复制 —— UUID / 配置路径都是要拿去用的东西。
   el("gw-kv").innerHTML = rows
-    .map(([k, v]) => `<div class="kv__row"><b>${escapeHtml(k)}</b><span>${escapeHtml(v)}</span></div>`)
+    .map(([k, v]) => `<div class="kv__row"><b>${escapeHtml(k)}</b>`
+      + `<span title="${escapeHtml(v)}" data-copy="${escapeHtml(v)}">${escapeHtml(v)}</span></div>`)
     .join("");
 }
 
@@ -222,6 +227,9 @@ function renderKeys() {
           <button class="btn btn--hot btn--tiny" data-act="test" data-id="${k.id}">
             ${icon("activity")}测活
           </button>
+          <button class="btn btn--ghost btn--tiny" data-act="balance" data-id="${k.id}">
+            ${icon("wallet")}查余额
+          </button>
           <button class="btn btn--ghost btn--tiny" data-act="models" data-id="${k.id}">
             ${icon("layers")}拉模型
           </button>
@@ -254,8 +262,29 @@ el("keys").addEventListener("click", async (event) => {
       state.keys = data.keys || state.keys;
       renderKeys();
       showProbe(r, entry);
-      toast(r.ok ? `测活通过 ${r.latency_ms}ms` : `测活失败: ${r.error || r.status}`,
-            r.ok ? "ok" : "bad");
+      if (r.stale_activation) {
+        // 测活通过但网关在用别的配置 —— 聊天会 401，必须说出来。
+        toast(r.stale_activation, "warn");
+      } else {
+        toast(r.ok ? `测活通过 ${r.latency_ms}ms` : `测活失败: ${r.error || r.status}`,
+              r.ok ? "ok" : "bad");
+      }
+    } else if (act === "balance") {
+      busy(btn, true);
+      const data = await api(`/api/keys/${id}/balance`);
+      if (data.ok) {
+        const bits = [];
+        if (data.remaining != null) bits.push(`余额 ${data.remaining} ${data.unit}`);
+        if (data.available != null) bits.push(`可用 ${data.available}`);
+        if (data.used != null) bits.push(`已用 ${data.used}`);
+        if (data.limit != null) bits.push(`额度 ${data.limit}`);
+        // 基元律动一个钱包给所有 KEY 共用，不标一下会以为是单 KEY 余额。
+        if (data.scope) bits.push(data.scope);
+        toast(bits.join(" · "), "ok");
+      } else {
+        // 余额接口不是 OpenAI 规范的一部分，很多服务商压根不提供。
+        toast(data.error || "查不到余额", "warn");
+      }
     } else if (act === "models") {
       busy(btn, true);
       // Activate this credential first so subsequent model switches apply to it.
@@ -285,6 +314,9 @@ el("btn-key-add").addEventListener("click", async (event) => {
     base_url: el("f-base").value.trim(),
     api_key: el("f-key").value.trim(),
     model: el("f-model").value.trim(),
+    // 选填，只为查余额用（基元律动的余额接口不认 API KEY）
+    account: el("f-account").value.trim(),
+    password: el("f-password").value,
   };
   if (!body.api_key) return toast("API KEY 不能为空", "bad");
   const btn = event.currentTarget;
@@ -364,6 +396,13 @@ function openEditor(entry) {
   el("e-provider").innerHTML = html;
   el("e-base").value = entry.base_url || "";
   el("e-key").value = "";          // Blank means "keep the stored secret".
+  el("e-account").value = entry.account || "";
+  el("e-password").value = "";     // 同上，留空表示不改密码
+  el("e-password").placeholder = entry.has_password
+    ? "已存密码，留空 = 不改动"
+    : "未存密码，填了才能查余额";
+  // 已经填过账号的默认展开，省得以为没保存。
+  el("e-web-wrap").open = !!(entry.account || entry.has_password);
   el("e-model").value = entry.model || "";
   sheet.hidden = false;
   el("e-note").focus();
@@ -396,6 +435,10 @@ el("edit-save").addEventListener("click", async (event) => {
   // wipe the stored secret.
   const newKey = el("e-key").value.trim();
   if (newKey) body.api_key = newKey;
+  // 账号是普通字段可以清空；密码同 api_key，留空表示保留原值。
+  body.account = el("e-account").value.trim();
+  const newPass = el("e-password").value;
+  if (newPass) body.password = newPass;
 
   const btn = event.currentTarget;
   try {
@@ -716,12 +759,21 @@ function finishTurn(rec, phase, payload = {}) {
   // done 事件带完整账单，把实际路由到的模型和开销摊开给操作者看：
   // 配置里写的是 flash，路由器可能升到 pro，不显示就完全看不出来。
   const bits = [];
-  if (payload.routed_model || payload.model) bits.push(payload.routed_model || payload.model);
+  const routed = payload.routed_model || payload.model;
+  if (routed) {
+    // 顶栏显示的是配置的模型，这里是实际执行的。两者不同时明确标「路由至」，
+    // 否则光看到两个不一样的模型名会以为哪里坏了。
+    const configured = state.gateway.model || "";
+    bits.push(configured && routed !== configured ? `路由至 ${routed}` : routed);
+  }
   if (payload.routed_tier) bits.push(`档 ${payload.routed_tier}`);
   const inTok = payload.input_tokens;
   const outTok = payload.output_tokens;
-  if (inTok != null || outTok != null) bits.push(`${inTok ?? "?"}→${outTok ?? "?"} tok`);
-  if (payload.cached_tokens) bits.push(`命中缓存 ${payload.cached_tokens}`);
+  // 别用「16306→104 tok」这种写法：小字号下箭头看起来像小数点，会被读成
+  // 一个带小数的 token 数。明确写出入/出。
+  if (inTok != null) bits.push(`入 ${inTok} tok`);
+  if (outTok != null) bits.push(`出 ${outTok} tok`);
+  if (payload.cached_tokens) bits.push(`命中缓存 ${payload.cached_tokens} tok`);
   if (payload.cost_usd != null) bits.push(`$${Number(payload.cost_usd).toFixed(6)}`);
   if (bits.length) {
     rec.meta.textContent = bits.join("  ·  ");
@@ -777,10 +829,129 @@ el("btn-stop").addEventListener("click", async () => {
     toast(err.message, "bad");
   }
 });
+// 事件委托：任何带 data-copy 的元素点一下就把全文复制走。
+document.addEventListener("click", async (ev) => {
+  const node = ev.target.closest?.("[data-copy]");
+  if (!node) return;
+  const text = node.dataset.copy || "";
+  if (!text || text === "—") return;
+  try {
+    await navigator.clipboard.writeText(text);
+    toast("已复制", "ok");
+  } catch {
+    toast("复制失败（浏览器拒绝了剪贴板权限）", "bad");
+  }
+});
+
 el("btn-clear").addEventListener("click", () => {
   el("log").innerHTML = "";
   turns.clear(); // 否则旧档案还指着已被删掉的节点
+  toast("已清屏（网关仍记得上文，要真正重开用「新对话」）", "warn");
 });
+
+// 清屏只擦浏览器 DOM，模型那边上下文还在；这个才是真正的新对话。
+el("btn-reset").addEventListener("click", async (event) => {
+  const btn = event.currentTarget;
+  busy(btn, true);
+  try {
+    await api("/api/chat/reset", { method: "POST" });
+    el("log").innerHTML = "";
+    turns.clear();
+    addTurn("system", "已开启新对话：网关上下文已清空。");
+    toast("网关上下文已清空", "ok");
+  } catch (err) {
+    toast(err.message, "bad");
+  } finally {
+    busy(btn, false);
+  }
+});
+
+/* ------------------------------------------------------ 路由 / 用量面板 */
+
+function renderRouting(data) {
+  const box = el("routing-box");
+  const cfg = data.config || {};
+  const decisions = data.decisions || [];
+  const rows = [];
+
+  rows.push(`<div class="rt__line">
+    <span class="rt__k">模式</span>
+    <span class="rt__v">${escapeHtml(cfg.mode || "—")}${
+      cfg.router_enabled ? " · 路由器已启用" : " · 路由器关闭"
+    }</span></div>`);
+  if (cfg.selection_mode) {
+    rows.push(`<div class="rt__line"><span class="rt__k">选择策略</span>
+      <span class="rt__v">${escapeHtml(cfg.selection_mode)}</span></div>`);
+  }
+
+  // 候选池：每个模型在编队里担任什么角色（primary / critic / …）。
+  const cands = (cfg.activation_preview || {}).candidates || [];
+  if (cands.length) {
+    const items = cands.map((c) => `<li><span class="rt__role">${escapeHtml(c.role || "")}</span>
+      ${escapeHtml(c.model || "")}<span class="rt__dim"> @ ${escapeHtml(c.provider || "")}</span></li>`);
+    rows.push(`<div class="rt__grp">候选池<ul class="rt__list">${items.join("")}</ul></div>`);
+  }
+
+  if (decisions.length) {
+    const items = decisions.slice(0, 6).map((d) => {
+      const when = d.tsMs ? new Date(d.tsMs).toLocaleTimeString("zh-CN", { hour12: false }) : "";
+      // 请求的模型和实际执行的模型经常不同，两个都显示才看得出路由做了什么。
+      const swapped = d.requestedModel && d.executedModel && d.requestedModel !== d.executedModel;
+      const route = swapped
+        ? `${escapeHtml(d.requestedModel)} <span class="rt__arrow">→</span> ${escapeHtml(d.executedModel)}`
+        : escapeHtml(d.executedModel || d.model || "—");
+      const saving = d.savingsPct != null ? ` · 省 ${d.savingsPct}%` : "";
+      const fallback = d.fallbackReason ? ` · 回退 ${escapeHtml(d.fallbackReason)}` : "";
+      return `<li>
+        <span class="rt__tier">${escapeHtml(d.finalTier || "?")}</span>
+        ${route}
+        <span class="rt__dim">${when}${saving}${fallback}</span>
+      </li>`;
+    });
+    rows.push(`<div class="rt__grp">最近决策<ul class="rt__list">${items.join("")}</ul></div>`);
+  } else if (data.decisions_error) {
+    rows.push(`<div class="rt__line rt__bad">决策查询失败: ${escapeHtml(data.decisions_error)}</div>`);
+  }
+
+  box.innerHTML = rows.join("");
+}
+
+async function loadRouting(btn) {
+  if (btn) busy(btn, true);
+  try {
+    renderRouting(await api("/api/routing"));
+  } catch (err) {
+    el("routing-box").textContent = `读取失败: ${err.message}`;
+  } finally {
+    if (btn) busy(btn, false);
+  }
+}
+
+async function loadUsage(btn) {
+  if (btn) busy(btn, true);
+  try {
+    const u = await api("/api/usage");
+    const pairs = [
+      ["总 token", u.totalTokens],
+      ["输入", u.totalInputTokens],
+      ["输出", u.totalOutputTokens],
+      ["缓存命中", u.totalCacheReadTokens],
+      ["累计开销", u.totalCostUsd != null ? `$${u.totalCostUsd}` : null],
+      ["会话数", u.totalSessions],
+    ].filter(([, v]) => v != null);
+    // 与 gw-kv 保持一致：键用 <b>，值用 <span>，否则 .kv__row 的样式不生效。
+    el("usage-kv").innerHTML = pairs
+      .map(([k, v]) => `<div class="kv__row"><b>${escapeHtml(k)}</b><span>${escapeHtml(String(v))}</span></div>`)
+      .join("");
+  } catch (err) {
+    el("usage-kv").textContent = `读取失败: ${err.message}`;
+  } finally {
+    if (btn) busy(btn, false);
+  }
+}
+
+el("btn-routing").addEventListener("click", (e) => loadRouting(e.currentTarget));
+el("btn-usage").addEventListener("click", (e) => loadUsage(e.currentTarget));
 
 el("btn-history").addEventListener("click", async (event) => {
   const btn = event.currentTarget;
@@ -789,14 +960,26 @@ el("btn-history").addEventListener("click", async (event) => {
     const data = await api("/api/chat/history?limit=40");
     el("log").innerHTML = "";
     turns.clear();
+    // 网关 chat.history 把正文放在 `text` 字段。以前这里只读 `content`，
+    // 于是每条都被当成空的跳过，界面看起来「拉取历史啥都没有」。
+    // content 分支保留做兜底，万一别的网关版本用它。
+    let shown = 0;
     for (const m of data.messages || []) {
       const role = m.role || m.author || "assistant";
-      const text = typeof m.content === "string"
-        ? m.content
-        : (m.content || []).map((p) => p.text || "").join("");
-      if (text) addTurn(role === "user" ? "user" : "assistant", text);
+      let text = m.text;
+      if (!text) {
+        text = typeof m.content === "string"
+          ? m.content
+          : (m.content || []).map((p) => p.text || "").join("");
+      }
+      if (!text) continue;
+      // 网关会在用户消息前面塞一行时间戳（[2026-08-03T19:43+08:00 …]），
+      // 回放时把它剥掉，否则每条历史都顶着一行噪音。
+      text = text.replace(/^\[\d{4}-\d{2}-\d{2}T[^\]]*\]\n?/, "");
+      addTurn(role === "user" ? "user" : "assistant", text);
+      shown += 1;
     }
-    toast(`载入 ${(data.messages || []).length} 条历史`, "ok");
+    toast(shown ? `载入 ${shown} 条历史` : "该会话暂无历史消息", shown ? "ok" : "warn");
   } catch (err) {
     toast(err.message, "bad");
   } finally {

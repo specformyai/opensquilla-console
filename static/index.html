@@ -75,8 +75,13 @@
             <button class="btn btn--ghost btn--tiny" id="btn-history" type="button">
               <i data-ic="clock"></i>拉取历史
             </button>
-            <button class="btn btn--ghost btn--tiny" id="btn-clear" type="button">
-              <i data-ic="trash-2"></i>清屏
+            <button class="btn btn--ghost btn--tiny" id="btn-clear" type="button"
+                    title="只清屏幕，网关仍记得上文">
+              <i data-ic="eraser"></i>清屏
+            </button>
+            <button class="btn btn--ghost btn--tiny" id="btn-reset" type="button"
+                    title="清空网关上下文，模型不再记得之前的对话">
+              <i data-ic="rotate-ccw"></i>新对话
             </button>
           </div>
 
@@ -134,6 +139,28 @@
               <div class="probe" id="probe-last">尚未测活。</div>
             </div>
           </div>
+
+          <div class="card">
+            <div class="card__head">
+              <i data-ic="route"></i>路由情况
+              <span class="spacer"></span>
+              <button class="btn btn--ghost btn--tiny" id="btn-routing" type="button">刷新</button>
+            </div>
+            <div class="card__body">
+              <div class="routing" id="routing-box">点「刷新」查看路由。</div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card__head">
+              <i data-ic="wallet"></i>用量 / 开销
+              <span class="spacer"></span>
+              <button class="btn btn--ghost btn--tiny" id="btn-usage" type="button">刷新</button>
+            </div>
+            <div class="card__body">
+              <div class="kv" id="usage-kv">点「刷新」查看用量。</div>
+            </div>
+          </div>
         </aside>
       </section>
 
@@ -175,6 +202,19 @@
               <label for="f-model">默认模型</label>
               <input id="f-model" placeholder="可留空，稍后从目录选" />
             </div>
+            <!-- 查余额用：基元律动只认网页登录态，API KEY 查不了余额。 -->
+            <details class="field-group">
+              <summary>网站账号（选填，仅用于查余额）</summary>
+              <div class="field">
+                <label for="f-account">账号</label>
+                <input id="f-account" autocomplete="off" placeholder="手机号 / 邮箱" />
+              </div>
+              <div class="field">
+                <label for="f-password">密码</label>
+                <input id="f-password" type="password" autocomplete="new-password"
+                       placeholder="仅本机保存，用于登录查余额" />
+              </div>
+            </details>
             <button class="btn btn--go" id="btn-key-add" type="button">
               <i data-ic="plus"></i>加入凭据库
             </button>
@@ -254,6 +294,19 @@
         <label for="e-model">默认模型</label>
         <input id="e-model" placeholder="可留空" />
       </div>
+      <!-- 基元律动的余额只能靠网页登录读，所以这里存网站账号密码。 -->
+      <details class="field-group" id="e-web-wrap">
+        <summary>网站账号（查余额用）</summary>
+        <div class="field">
+          <label for="e-account">账号</label>
+          <input id="e-account" autocomplete="off" placeholder="手机号 / 邮箱" />
+        </div>
+        <div class="field">
+          <label for="e-password">密码</label>
+          <input id="e-password" type="password" autocomplete="new-password"
+                 placeholder="留空 = 不改动现有密码" />
+        </div>
+      </details>
     </div>
     <div class="sheet__acts">
       <button class="btn btn--go" id="edit-save" type="button">

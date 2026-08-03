@@ -513,11 +513,14 @@ body {
 }
 .turn__reason > summary {
   cursor: pointer;
-  font-size: 10px;
+  /* 10px + 只有文字宽度的热区太难点，给到 11px 并补 padding 撑开点击区域。 */
+  font-size: 11px;
   letter-spacing: 0.12em;
   /* --dust-dim 在这个深底上不足 3:1，折叠开关是要点的，提一档到 --dust */
   color: var(--dust);
   user-select: none;
+  padding: 3px 6px 3px 0;
+  border-radius: 4px;
 }
 .turn__reason > summary:hover { color: var(--spec-violet); }
 .turn__reason-body {
@@ -532,9 +535,10 @@ body {
 /* 收尾后的账单行：实际路由到的模型往往不是配置里那个，得让人看见。 */
 .turn__meta {
   margin: 7px 0 0 14px;
-  font-size: 10px;
+  /* 10px 配等宽数字太挤，容易把 · 分隔符和数字看混；11px 明显好读。
+     颜色用 --dust（对深底 7.6:1，远超 AA 4.5:1）。 */
+  font-size: 11px;
   letter-spacing: 0.06em;
-  /* 五段信息密度不低，--dust-dim 太暗读起来费眼，提到 --dust */
   color: var(--dust);
 }
 
@@ -658,6 +662,89 @@ textarea#msg::placeholder { color: var(--dust-dim); }
 .card__head .spacer { margin-left: auto; }
 .card__body { padding: 12px 13px; }
 
+/* 选填字段折叠组（网站账号密码，只为查余额） */
+.field-group {
+  border: 1px solid var(--ink-300);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: rgba(255, 255, 255, 0.015);
+}
+.field-group > summary {
+  cursor: pointer;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  color: var(--dust);
+  user-select: none;
+  padding: 2px 0;
+}
+.field-group > summary:hover { color: var(--spec-cyan); }
+.field-group[open] > summary { margin-bottom: 8px; }
+
+/* ------------------------------------------------------------ 路由情况面板 */
+
+.routing { display: grid; gap: 10px; font-size: 11px; color: var(--dust); }
+.rt__line { display: flex; gap: 8px; align-items: baseline; }
+.rt__k {
+  flex: 0 0 60px;
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  color: var(--dust);
+  text-transform: uppercase;
+}
+.rt__v { color: var(--pearl); }
+.rt__bad { color: var(--bad); }
+.rt__grp {
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  color: var(--dust);
+  text-transform: uppercase;
+}
+.rt__list {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 5px;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--dust);
+}
+.rt__list li {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: baseline;
+  padding-left: 8px;
+  border-left: 1px solid color-mix(in oklab, var(--spec-violet) 30%, transparent);
+}
+/* 编队角色（primary / critic / …），窄标签防止被压扁 */
+.rt__role {
+  flex: 0 0 auto;
+  padding: 1px 5px;
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--spec-violet);
+  background: color-mix(in oklab, var(--spec-violet) 14%, transparent);
+  border-radius: 3px;
+}
+/* 路由档位 c0/c1/c2 */
+.rt__tier {
+  flex: 0 0 auto;
+  padding: 1px 5px;
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--spec-cyan);
+  background: color-mix(in oklab, var(--spec-cyan) 14%, transparent);
+  border-radius: 3px;
+}
+.rt__arrow { color: var(--spec-amber); }
+/* 时间/省钱比等次要信息，比主文字淡一档（3.36:1，非正文可接受） */
+.rt__dim { color: var(--dust-dim); }
+
 .kv { display: grid; gap: 8px; }
 .kv__row {
   display: grid;
@@ -676,8 +763,14 @@ textarea#msg::placeholder { color: var(--dust-dim); }
 .kv__row span {
   color: var(--pearl);
   text-align: left;
-  overflow-wrap: anywhere;
+  /* 原来是 overflow-wrap: anywhere，UUID 和文件路径会在中间硬断成两行，
+     断点毫无语义、扫读困难。改成单行省略；全文靠 title 悬停，点击可复制。 */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
 }
+.kv__row span:hover { color: var(--spec-cyan); }
 
 /* ----------------------------------------------------------------- buttons */
 
@@ -1134,10 +1227,12 @@ textarea#msg::placeholder { color: var(--dust-dim); }
 .toast--ok { border-left-color: var(--ok); }
 .toast--bad { border-left-color: var(--bad); }
 .toast--info { border-left-color: var(--spec-cyan); }
+.toast--warn { border-left-color: var(--warn); }
 .toast .ic { width: 15px; height: 15px; flex: 0 0 auto; margin-top: 1px; }
 .toast--ok .ic { color: var(--ok); }
 .toast--bad .ic { color: var(--bad); }
 .toast--info .ic { color: var(--spec-cyan); }
+.toast--warn .ic { color: var(--warn); }
 
 @keyframes toastIn {
   from { opacity: 0; transform: translate3d(24px, 10px, 0) scale(0.94); }
