@@ -1564,11 +1564,39 @@ async def api_routing() -> JSONResponse:
     except Exception as exc:  # noqa: BLE001 - surface partial data
         out["config_error"] = str(exc)
     try:
-        decisions = await link.rpc("router.decisions.list", {"limit": 12}, timeout=25) or {}
+        # The RPC clamps at 200; 60 is plenty of scrollback for one sitting.
+        decisions = await link.rpc("router.decisions.list", {"limit": 60}, timeout=25) or {}
         out["decisions"] = decisions.get("decisions") or []
     except Exception as exc:  # noqa: BLE001 - surface partial data
         out["decisions_error"] = str(exc)
     return JSONResponse(out)
+
+
+class FeedbackPayload(BaseModel):
+    decision_id: str
+    rating: str  # up / down / neutral
+
+
+@app.post("/api/routing/feedback")
+async def api_routing_feedback(payload: FeedbackPayload) -> JSONResponse:
+    """Rate one routing decision (feeds the self-learning trainer offline).
+
+    A decision the gateway no longer knows about (retention pruned) comes back
+    as accepted:false rather than an error, so the UI can say "record expired"
+    instead of showing a failure.
+    """
+    rating = payload.rating.strip().lower()
+    if rating not in {"up", "down", "neutral"}:
+        raise HTTPException(status_code=400, detail="rating 只能是 up / down / neutral")
+    try:
+        out = await link.rpc(
+            "router.feedback.submit",
+            {"decisionId": payload.decision_id, "rating": rating},
+            timeout=25,
+        )
+    except Exception as exc:  # noqa: BLE001 - surface gateway wording
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return JSONResponse(out or {})
 
 
 @app.post("/api/gateway/reconnect")

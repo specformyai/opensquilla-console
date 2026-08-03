@@ -829,6 +829,34 @@ el("btn-stop").addEventListener("click", async () => {
     toast(err.message, "bad");
   }
 });
+// 决策打分。网关说"记录已过期"时给 accepted:false，不是报错，要分开讲。
+document.addEventListener("click", async (ev) => {
+  const btn = ev.target.closest?.(".rt__vote");
+  if (!btn) return;
+  const wrap = btn.closest(".rt__rate");
+  const decisionId = wrap?.dataset.decision;
+  if (!decisionId) return;
+  // 不用 busy()：它会把按钮文字换成"处理中"，这两个按钮只有一个字宽，会被撑坏。
+  btn.disabled = true;
+  try {
+    const out = await api("/api/routing/feedback", {
+      method: "POST",
+      body: JSON.stringify({ decision_id: decisionId, rating: btn.dataset.rating }),
+    });
+    if (out.accepted === false) {
+      toast("这条路由记录已过期，网关不再保留", "warn");
+    } else {
+      wrap.querySelectorAll(".rt__vote").forEach((b) => b.classList.remove("is-picked"));
+      btn.classList.add("is-picked");
+      toast(btn.dataset.rating === "up" ? "已记录：合适" : "已记录：不合适", "ok");
+    }
+  } catch (err) {
+    toast(err.message, "bad");
+  } finally {
+    btn.disabled = false;
+  }
+});
+
 // 事件委托：任何带 data-copy 的元素点一下就把全文复制走。
 document.addEventListener("click", async (ev) => {
   const node = ev.target.closest?.("[data-copy]");
@@ -867,6 +895,86 @@ el("btn-reset").addEventListener("click", async (event) => {
 });
 
 /* ------------------------------------------------------ 路由 / 用量面板 */
+
+// 网关的 trail 是一串英文 stage 名 + 裸参数，直接铺出来没人看得懂。
+// 每个阶段翻成「做了什么 / 有没有生效 / 依据是什么」三件事。
+const TRAIL_STAGES = {
+  classify: (s) => ({
+    name: "分类",
+    desc: `判为 ${s.tier || "?"} 档${s.route_class ? `（路由类 ${s.route_class}）` : ""}`,
+    fired: null,   // 分类不是"生效/未生效"，它总是发生
+  }),
+  confidence_gate: (s) => ({
+    name: "置信度闸门",
+    desc: s.applied
+      ? `置信度低于 ${s.threshold}，回落到默认 ${s.default_tier} 档`
+      : `置信度达标（阈值 ${s.threshold}），保留分类结果`,
+    fired: !!s.applied,
+  }),
+  complaint_upgrade: (s) => ({
+    name: "抱怨升档",
+    desc: s.applied
+      ? `检测到 ${s.terms_count} 个不满信号，升档`
+      : "没有检测到不满信号",
+    fired: !!s.applied,
+  }),
+  anti_downgrade: (s) => ({
+    name: "防降档",
+    desc: s.applied
+      ? `${s.window_seconds}秒内曾用 ${s.previous_tier} 档，拉回同档避免忽高忽低`
+      : `${s.window_seconds}秒窗口内无需拉回（上次 ${s.previous_tier || "无"}）`,
+    fired: !!s.applied,
+  }),
+  final: (s) => ({
+    name: "最终",
+    desc: `${s.tier || "?"} 档${s.route_class ? `（${s.route_class}）` : ""}`,
+    fired: null,
+  }),
+};
+
+function renderTrail(d) {
+  const trail = d.trail || [];
+  if (!trail.length) return "";
+  const steps = trail.map((s) => {
+    const fn = TRAIL_STAGES[s.stage];
+    // 未知阶段兜底：网关加了新 stage 也不至于空白，原样显示参数。
+    const info = fn ? fn(s) : {
+      name: s.stage || "?",
+      desc: Object.entries(s).filter(([k]) => k !== "stage")
+        .map(([k, v]) => `${k}=${v}`).join(" ") || "—",
+      fired: s.applied === undefined ? null : !!s.applied,
+    };
+    const mark = info.fired === null ? "rt__step--flat"
+      : info.fired ? "rt__step--on" : "rt__step--off";
+    return `<li class="rt__step ${mark}">
+      <span class="rt__step-n">${escapeHtml(info.name)}</span>
+      <span class="rt__step-d">${escapeHtml(info.desc)}</span>
+    </li>`;
+  });
+  // 分类器版本/思考档位/置信度这些是整条决策的属性，不属于某个阶段。
+  const facts = [];
+  if (d.confidence != null) facts.push(`置信度 ${(d.confidence * 100).toFixed(1)}%`);
+  if (d.thinkingLevel) facts.push(`思考 ${d.thinkingLevel}`);
+  if (d.classifier) facts.push(`分类器 ${d.classifier}`);
+  if (d.baselineModel) facts.push(`基线 ${d.baselineModel}`);
+  if (d.executedKind) facts.push(d.executedKind === "single" ? "单模型" : d.executedKind);
+  if (d.fallbackHops) facts.push(`回退 ${d.fallbackHops} 跳`);
+
+  const rated = d.decisionId
+    ? `<div class="rt__rate" data-decision="${escapeHtml(d.decisionId)}">
+         <span class="rt__dim">这次路由合适吗</span>
+         <button type="button" class="rt__vote" data-rating="up" title="合适">好</button>
+         <button type="button" class="rt__vote" data-rating="down" title="不合适">差</button>
+       </div>`
+    : "";
+
+  return `<details class="rt__why">
+    <summary>决策过程</summary>
+    <ul class="rt__steps">${steps.join("")}</ul>
+    ${facts.length ? `<div class="rt__facts">${escapeHtml(facts.join(" · "))}</div>` : ""}
+    ${rated}
+  </details>`;
+}
 
 function renderRouting(data) {
   const box = el("routing-box");
@@ -908,7 +1016,8 @@ function renderRouting(data) {
   }
 
   if (decisions.length) {
-    const items = decisions.slice(0, 6).map((d) => {
+    // 全部列出，面板自身可滚动；原来砍到 6 条，剩下的看不到。
+    const items = decisions.map((d) => {
       const when = d.tsMs ? new Date(d.tsMs).toLocaleTimeString("zh-CN", { hour12: false }) : "";
       // 请求的模型和实际执行的模型经常不同，两个都显示才看得出路由做了什么。
       const swapped = d.requestedModel && d.executedModel && d.requestedModel !== d.executedModel;
@@ -922,6 +1031,10 @@ function renderRouting(data) {
       const fallback = d.fallbackReason
         ? `<div class="rt__dim rt__fb">回退 ${escapeHtml(d.fallbackReason)}</div>`
         : "";
+      // 分档被抬升/压低时标出来，否则只看最终档位不知道路由器干预过。
+      const moved = d.proposedTier && d.finalTier && d.proposedTier !== d.finalTier
+        ? `<span class="rt__moved">${escapeHtml(d.proposedTier)} → ${escapeHtml(d.finalTier)}</span>`
+        : "";
       return `<li class="rt__dec">
         <div class="rt__dec-top">
           <span class="rt__tier">${escapeHtml(d.finalTier || "?")}</span>
@@ -929,15 +1042,14 @@ function renderRouting(data) {
         </div>
         <div class="rt__dec-bot">
           <span class="rt__dim">${when}</span>
+          ${moved}
           ${saving}
         </div>
         ${fallback}
+        ${renderTrail(d)}
       </li>`;
     });
-    // 标出总条数，否则列表贴着下一个面板截断，看不出还有没有更多。
-    const more = decisions.length > items.length
-      ? `<span class="rt__dim"> · 共 ${decisions.length} 条，显示最近 ${items.length}</span>`
-      : `<span class="rt__dim"> · 共 ${decisions.length} 条</span>`;
+    const more = `<span class="rt__dim"> · 共 ${decisions.length} 条，可滚动</span>`;
     rows.push(`<div class="rt__grp">最近决策${more}<ul class="rt__list rt__list--dec">${items.join("")}</ul></div>`);
   } else if (data.decisions_error) {
     rows.push(`<div class="rt__line rt__bad">决策查询失败: ${escapeHtml(data.decisions_error)}</div>`);

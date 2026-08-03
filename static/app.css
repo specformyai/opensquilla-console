@@ -749,7 +749,109 @@ textarea#msg::placeholder { color: var(--dust-dim); }
 .rt__at { flex: 0 0 auto; }
 /* 最近决策：每条两行。原来条目内行距和条目间距几乎一样，扫读时分不清
    某个时间戳属于上面还是下面那条，所以拉开间距并加一条极淡的分隔线。 */
-.rt__list--dec { gap: 0; }
+.rt__list--dec {
+  gap: 0;
+  /* 全部决策都列出来，靠面板内滚动，不再截断到固定条数 */
+  max-height: 320px;
+  overflow-y: auto;
+  /* 滚动条不要盖住右对齐的省N%；底部留白避免"好/差"按钮贴边被裁 */
+  padding-right: 4px;
+  padding-bottom: 6px;
+}
+
+/* 分档被抬升/压低的标记，比"省N%"更该被注意到 */
+.rt__moved {
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding: 0 4px;
+  color: var(--spec-amber);
+  font-variant-numeric: tabular-nums;
+}
+/* 有 moved 时它占了 auto 边距，省N% 就不该再抢 */
+.rt__moved + .rt__save { margin-left: 6px; }
+
+/* 决策过程折叠区 */
+.rt__why { margin-top: 5px; }
+.rt__why > summary {
+  cursor: pointer;
+  font-size: 11px;
+  padding: 2px 0;
+  color: var(--dust);
+  list-style: none;
+}
+.rt__why > summary::-webkit-details-marker { display: none; }
+.rt__why > summary::before {
+  content: "▸ ";
+  color: var(--spec-cyan);
+}
+.rt__why[open] > summary::before { content: "▾ "; }
+.rt__why > summary:hover { color: var(--spec-violet); }
+
+.rt__steps {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0 0 0 2px;
+  display: grid;
+  gap: 3px;
+}
+/* 同 .rt__dec：要压过 .rt__list li 的 display:flex，否则 grid 列宽不生效，
+   说明文字会各起各的 x（实测四个不同起点），根本不成列。 */
+.rt__steps li.rt__step {
+  display: grid;
+  /* 阶段名定宽成一列，右边说明才对得齐 */
+  grid-template-columns: 84px 1fr;
+  gap: 6px;
+  font-size: 11px;
+  line-height: 1.45;
+}
+.rt__step-n {
+  color: var(--dust);
+  /* 不许折行，否则定宽列会被撑破 */
+  white-space: nowrap;
+}
+.rt__step-d { color: var(--pearl); min-width: 0; }
+/* 生效的阶段是重点（真正改变了结果），未生效的压暗。
+   不能只靠颜色区分（WCAG 1.4.1），生效的额外加 ● 前缀。 */
+.rt__step--on .rt__step-n { color: var(--spec-amber); }
+.rt__step--on .rt__step-d { color: var(--spec-amber); }
+.rt__step--on .rt__step-n::before { content: "● "; }
+.rt__step--off .rt__step-d { color: var(--dust); }
+.rt__step--off .rt__step-n::before { content: "○ "; }
+.rt__step--flat .rt__step-n { color: var(--spec-cyan); }
+
+.rt__facts {
+  margin-top: 5px;
+  font-size: 11px;
+  color: var(--dust);
+  line-height: 1.5;
+}
+
+/* 决策打分 */
+.rt__rate {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  font-size: 11px;
+}
+.rt__vote {
+  padding: 1px 8px;
+  font-size: 11px;
+  color: var(--dust);
+  background: transparent;
+  border: 1px solid var(--ink-300);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.rt__vote:hover:not(:disabled) {
+  color: var(--pearl);
+  border-color: var(--spec-cyan);
+}
+.rt__vote:disabled { opacity: 0.5; cursor: default; }
+.rt__vote.is-picked {
+  color: var(--ok);
+  border-color: var(--ok);
+}
 /* 必须压过 .rt__list li 的 display:flex（同特异度但它在前面），否则两个内层
    div 会并排而不是上下堆叠，下行的 space-between 也就撑不开整行宽度。 */
 .rt__list--dec li.rt__dec {
