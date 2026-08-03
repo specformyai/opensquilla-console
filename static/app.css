@@ -434,7 +434,8 @@ body {
 }
 
 .turn__tag {
-  display: inline-flex;
+  display: flex;
+  flex-wrap: wrap; /* 状态条挤进来时换行，而不是把标签文字压扁 */
   align-items: center;
   gap: 7px;
   font-size: 10px;
@@ -454,6 +455,89 @@ body {
   padding-left: 14px;
   border-left: 1px solid var(--ink-400);
 }
+/* ------------------------------------------------ 回复状态（阶段指示） */
+
+/* 挂在 SQUILLA 标签右侧，跟着网关状态机走：
+   已排队 -> 已受理 -> 思考中 -> 输出中 -> 完成。 */
+.turn__phase {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: 8px;
+  padding: 1px 8px 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--ink-400);
+  background: var(--ink-100);
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  color: var(--dust-dim);
+  text-transform: none;
+  flex: 0 0 auto;
+}
+.turn__dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: 0 0 auto;
+}
+
+/* 未完成的阶段让圆点呼吸，一眼能看出还在跑还是已经停了。 */
+.turn__phase[data-phase="queued"],
+.turn__phase[data-phase="running"] { color: var(--dust-dim); }
+.turn__phase[data-phase="thinking"] { color: var(--spec-violet); }
+.turn__phase[data-phase="streaming"] { color: var(--spec-cyan); }
+.turn__phase[data-phase="done"] { color: var(--ok); }
+.turn__phase[data-phase="aborted"] { color: var(--warn); }
+.turn__phase[data-phase="error"] { color: var(--bad); }
+
+.turn__phase[data-phase="queued"] .turn__dot,
+.turn__phase[data-phase="running"] .turn__dot,
+.turn__phase[data-phase="thinking"] .turn__dot,
+.turn__phase[data-phase="streaming"] .turn__dot {
+  animation: phasePulse 1.15s ease-in-out infinite;
+}
+@keyframes phasePulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.25; transform: scale(0.65); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .turn__phase .turn__dot { animation: none; }
+}
+
+/* 思考流折叠收纳，默认不展开，避免推理内容盖住正式回答。 */
+.turn__reason {
+  margin: 0 0 6px 14px;
+  border-left: 1px dashed var(--ink-500);
+  padding-left: 10px;
+}
+.turn__reason > summary {
+  cursor: pointer;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  /* --dust-dim 在这个深底上不足 3:1，折叠开关是要点的，提一档到 --dust */
+  color: var(--dust);
+  user-select: none;
+}
+.turn__reason > summary:hover { color: var(--spec-violet); }
+.turn__reason-body {
+  margin-top: 5px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--dust-dim);
+}
+
+/* 收尾后的账单行：实际路由到的模型往往不是配置里那个，得让人看见。 */
+.turn__meta {
+  margin: 7px 0 0 14px;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  /* 五段信息密度不低，--dust-dim 太暗读起来费眼，提到 --dust */
+  color: var(--dust);
+}
+
 .turn--me .turn__body { border-left-color: color-mix(in oklab, var(--spec-cyan) 55%, transparent); }
 .turn--ai .turn__body { border-left-color: color-mix(in oklab, var(--spec-violet) 55%, transparent); }
 .turn--sys .turn__body { border-left-color: color-mix(in oklab, var(--warn) 55%, transparent); color: var(--dust); }
@@ -881,6 +965,15 @@ textarea#msg::placeholder { color: var(--dust-dim); }
 }
 .probe__head .ok { color: var(--ok); }
 .probe__head .bad { color: var(--bad); }
+/* Makes it visible that the probe went through the gateway rather than
+   straight at the upstream endpoint. */
+.probe__via {
+  color: var(--spec-cyan);
+  border: 1px solid color-mix(in oklab, var(--spec-cyan) 30%, transparent);
+  border-radius: 999px;
+  padding: 1px 7px;
+  font-size: 9px;
+}
 
 .keycard__acts {
   display: flex;

@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -136,8 +137,8 @@ SESSION_TTL = 12 * 3600
 LOGIN_LOCK_AFTER = 5
 LOGIN_LOCK_SECONDS = 300
 
-# token -> expiry epoch
-_sessions: dict[str, float] = {}
+# Sessions are stateless signed tokens (see _issue_session), so there is no
+# server-side registry to keep here.
 # client ip -> [fail_count, locked_until_epoch]
 _login_fails: dict[str, list[float]] = {}
 
@@ -154,27 +155,43 @@ def _auth_enabled() -> bool:
     return bool(AUTH_PASSWORD)
 
 
+def _session_secret() -> bytes:
+    """Signing key derived from the configured password.
+
+    Deriving it means a password change invalidates every outstanding session
+    for free, and no key material needs to be persisted anywhere.
+    """
+    return hashlib.sha256(f"squilla-console-session/{AUTH_PASSWORD}".encode()).digest()
+
+
 def _issue_session() -> str:
-    token = secrets.token_urlsafe(32)
-    now = time.time()
-    # Opportunistically drop expired tokens so the dict cannot grow unbounded.
-    for old, expiry in list(_sessions.items()):
-        if expiry <= now:
-            del _sessions[old]
-    _sessions[token] = now + SESSION_TTL
-    return token
+    """Mint a self-contained ``<expiry>.<hmac>`` token.
+
+    Sessions used to live in a process-local dict, which meant every service
+    restart silently logged everyone out — during a deploy that looks exactly
+    like a broken gateway, because the browser's /ws handshake starts getting
+    rejected with no explanation. A signed token survives restarts without any
+    server-side state to keep.
+    """
+    expiry = int(time.time() + SESSION_TTL)
+    payload = str(expiry).encode()
+    sig = hmac.new(_session_secret(), payload, hashlib.sha256).hexdigest()
+    return f"{expiry}.{sig}"
 
 
 def _session_valid(token: str | None) -> bool:
-    if not token:
+    if not token or "." not in token:
         return False
-    expiry = _sessions.get(token)
-    if expiry is None:
+    expiry_raw, _, sig = token.partition(".")
+    try:
+        expiry = int(expiry_raw)
+    except ValueError:
         return False
     if expiry <= time.time():
-        del _sessions[token]
         return False
-    return True
+    expected = hmac.new(_session_secret(), expiry_raw.encode(), hashlib.sha256).hexdigest()
+    # Constant-time compare so a forged cookie cannot be tuned byte by byte.
+    return hmac.compare_digest(sig, expected)
 
 
 def _client_ip(request: Request) -> str:
@@ -707,6 +724,80 @@ def _is_anthropic_style(base_url: str, provider: str) -> bool:
     }
 
 
+async def probe_via_gateway(
+    base_url: str, api_key: str, model: str, provider: str
+) -> dict[str, Any]:
+    """Probe a credential through OpenSquilla instead of calling the upstream.
+
+    Uses ``onboarding.provider.probe``, the gateway's own probe RPC. It takes the
+    candidate credential inline (providerId/model/apiKey/baseUrl), runs a live
+    one-token request through the gateway's provider stack, and saves nothing —
+    so the currently activated credential is left untouched.
+
+    This is the honest answer to "does OpenSquilla accept this credential",
+    which a direct upstream call cannot tell us: the provider-id validation and
+    credential-shape checks live in the gateway, not upstream. The trade-off is
+    that the RPC replies with ok/failureKind/latency only — it sends "ping" with
+    max_tokens=1 and does not return generated text. When the operator wants to
+    see a real answer, the chat panel is the place for that.
+    """
+    if not (base_url or "").strip():
+        return {"ok": False, "error": "缺少 base_url", "at": int(time.time()), "via": "gateway"}
+    if not (model or "").strip():
+        return {"ok": False, "error": "缺少模型名", "at": int(time.time()), "via": "gateway"}
+
+    started = time.perf_counter()
+    try:
+        result = await link.rpc(
+            "onboarding.provider.probe",
+            {
+                "providerId": provider,
+                "model": model,
+                "apiKey": api_key,
+                "baseUrl": base_url,
+            },
+            timeout=90.0,
+        )
+    except Exception as exc:  # noqa: BLE001 - surfaced verbatim to the operator
+        return {
+            "ok": False,
+            "latency_ms": int((time.perf_counter() - started) * 1000),
+            "error": f"{type(exc).__name__}: {exc}",
+            "model": model,
+            "via": "gateway",
+            "at": int(time.time()),
+        }
+
+    local_ms = int((time.perf_counter() - started) * 1000)
+    if not isinstance(result, dict):
+        return {
+            "ok": False,
+            "latency_ms": local_ms,
+            "error": f"网关返回了意外结构: {type(result).__name__}",
+            "model": model,
+            "via": "gateway",
+            "at": int(time.time()),
+        }
+
+    ok = bool(result.get("ok"))
+    kind = str(result.get("failureKind") or "")
+    message = str(result.get("message") or "")
+    # The RPC's own latency excludes the console<->gateway hop; keep both so a
+    # slow local link cannot be mistaken for a slow provider.
+    return {
+        "ok": ok,
+        "latency_ms": int(result.get("latencyMs") or 0) or local_ms,
+        "round_trip_ms": local_ms,
+        "first_response_ms": result.get("firstResponseMs"),
+        "model": str(result.get("model") or model),
+        "provider": str(result.get("providerId") or provider),
+        "failure_kind": kind,
+        "error": None if ok else (message or kind or "网关未说明失败原因"),
+        "via": "gateway",
+        "at": int(time.time()),
+    }
+
+
 async def probe_endpoint(base_url: str, api_key: str, model: str, provider: str) -> dict[str, Any]:
     """Ask PROBE_QUESTION straight at the provider endpoint and time it."""
     base = (base_url or "").rstrip("/")
@@ -891,7 +982,9 @@ async def api_login(payload: LoginPayload, request: Request) -> JSONResponse:
 
 @app.post("/api/logout")
 async def api_logout(request: Request) -> JSONResponse:
-    _sessions.pop(request.cookies.get(SESSION_COOKIE) or "", None)
+    # Signed tokens carry no server-side handle to revoke; clearing the cookie
+    # is the logout. Acceptable for a single-operator console — a stolen cookie
+    # would stay valid until its expiry, which is why the TTL is bounded.
     response = JSONResponse({"ok": True})
     response.delete_cookie(SESSION_COOKIE, path="/")
     return response
@@ -1147,7 +1240,7 @@ async def api_keys_test(key_id: str) -> JSONResponse:
     entry = store.raw(key_id)
     if entry is None:
         raise HTTPException(404, "凭据不存在")
-    result = await probe_endpoint(
+    result = await probe_via_gateway(
         entry["base_url"], entry["api_key"], entry.get("model") or "", entry["provider"]
     )
     await store.record_test(key_id, result)
@@ -1156,13 +1249,21 @@ async def api_keys_test(key_id: str) -> JSONResponse:
 
 @app.post("/api/test/all")
 async def api_test_all() -> JSONResponse:
-    """Probe every stored credential concurrently with the same question."""
+    """Probe every stored credential through the gateway, one at a time.
+
+    Sequential on purpose: the gateway accepts a single client WebSocket, so
+    concurrent probes would contend for the one link (and a second connection
+    gets the existing one closed with 1012). Slower, but it actually completes.
+    """
     entries = [store.raw(k["id"]) for k in store.public()]
     entries = [e for e in entries if e]
-    results = await asyncio.gather(*[
-        probe_endpoint(e["base_url"], e["api_key"], e.get("model") or "", e["provider"])
-        for e in entries
-    ])
+    results = []
+    for e in entries:
+        results.append(
+            await probe_via_gateway(
+                e["base_url"], e["api_key"], e.get("model") or "", e["provider"]
+            )
+        )
     for entry, result in zip(entries, results, strict=True):
         await store.record_test(entry["id"], result)
     return JSONResponse({

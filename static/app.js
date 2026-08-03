@@ -178,7 +178,16 @@ function renderKeys() {
              <span class="${t.ok ? "ok" : "bad"}">${t.ok ? "PASS" : "FAIL"}</span>
              <span>${t.latency_ms ?? "?"} ms</span>
              <span>${escapeHtml(t.model || "")}</span>
-           </div>${escapeHtml(t.ok ? (t.answer || "").slice(0, 400) : t.error || "")}</div>`
+             ${t.via === "gateway" ? `<span class="probe__via">经 OPENSQUILLA</span>` : ""}
+           </div>${escapeHtml(
+             t.ok
+               ? t.answer
+                 ? (t.answer || "").slice(0, 400)
+                 : `网关接受了这条凭据，一次性探测通过${
+                     t.first_response_ms ? `，首字 ${t.first_response_ms} ms` : ""
+                   }。要看模型实际回答请用对话面板。`
+               : t.error || ""
+           )}</div>`
       : "";
     return `
       <article class="keycard ${k.active ? "is-active" : ""}" style="animation-delay:${i * 0.04}s">
@@ -619,22 +628,127 @@ function addTurn(role, text = "") {
   return wrap.querySelector(".turn__body");
 }
 
+/* --------------------------------------------------------- 回复轮次管理 */
+
+/* 每个助手回复对应一个 bubble，按网关给的 turn_id 索引。
+   以前只用一个全局 state.currentTurn，而关闭它依赖的结束事件名
+   （message_complete / turn_complete / idle）网关根本不会发 —— 真实事件是
+   session.event.done。于是 bubble 永远不关，下一轮回复继续往同一个
+   节点里 append，所有回复糊成一坨。改成按 turn_id 建档后，每轮各自
+   独立，谁先谁后都不会串。 */
+const turns = new Map();
+
+/* 网关的状态机：idle -> thinking -> streaming -> done，另加排队与失败态。 */
+const PHASE_TEXT = {
+  queued: "已排队",
+  running: "已受理",
+  thinking: "思考中",
+  streaming: "输出中",
+  done: "完成",
+  aborted: "已中断",
+  error: "失败",
+};
+
+function ensureTurn(turnId) {
+  const key = turnId || "_pending";
+  let rec = turns.get(key);
+  if (rec) return rec;
+
+  const log = el("log");
+  const wrap = document.createElement("div");
+  wrap.className = "turn turn--ai";
+  wrap.innerHTML = `
+    <div class="turn__tag">${icon("square-terminal")}SQUILLA
+      <span class="turn__phase" data-phase="queued">
+        <i class="turn__dot"></i><span class="turn__phase-text">已排队</span>
+      </span>
+    </div>
+    <details class="turn__reason" hidden>
+      <summary>思考过程</summary><div class="turn__reason-body"></div>
+    </details>
+    <div class="turn__body"></div>
+    <div class="turn__meta" hidden></div>`;
+  log.appendChild(wrap);
+  log.scrollTop = log.scrollHeight;
+
+  rec = {
+    wrap,
+    body: wrap.querySelector(".turn__body"),
+    phase: wrap.querySelector(".turn__phase"),
+    phaseText: wrap.querySelector(".turn__phase-text"),
+    reason: wrap.querySelector(".turn__reason"),
+    reasonBody: wrap.querySelector(".turn__reason-body"),
+    meta: wrap.querySelector(".turn__meta"),
+    startedAt: Date.now(),
+    done: false,
+  };
+  turns.set(key, rec);
+  return rec;
+}
+
+/* 第一个带 turn_id 的事件到达时，把先前建的临时档案改挂到真 id 上，
+   这样后续事件不会另开一个 bubble。 */
+function adoptTurnId(turnId) {
+  if (!turnId || turns.has(turnId)) return;
+  const pending = turns.get("_pending");
+  if (pending) {
+    turns.delete("_pending");
+    turns.set(turnId, pending);
+  }
+}
+
+function setPhase(rec, phase) {
+  if (!rec || rec.done) return;
+  rec.phase.dataset.phase = phase;
+  rec.phaseText.textContent = PHASE_TEXT[phase] || phase;
+  if (phase === "streaming") rec.body.classList.add("caret");
+  else rec.body.classList.remove("caret");
+}
+
+function finishTurn(rec, phase, payload = {}) {
+  if (!rec) return;
+  rec.done = true;
+  rec.phase.dataset.phase = phase;
+  const secs = ((Date.now() - rec.startedAt) / 1000).toFixed(1);
+  rec.phaseText.textContent = `${PHASE_TEXT[phase] || phase} · ${secs}s`;
+  rec.body.classList.remove("caret");
+
+  // done 事件带完整账单，把实际路由到的模型和开销摊开给操作者看：
+  // 配置里写的是 flash，路由器可能升到 pro，不显示就完全看不出来。
+  const bits = [];
+  if (payload.routed_model || payload.model) bits.push(payload.routed_model || payload.model);
+  if (payload.routed_tier) bits.push(`档 ${payload.routed_tier}`);
+  const inTok = payload.input_tokens;
+  const outTok = payload.output_tokens;
+  if (inTok != null || outTok != null) bits.push(`${inTok ?? "?"}→${outTok ?? "?"} tok`);
+  if (payload.cached_tokens) bits.push(`命中缓存 ${payload.cached_tokens}`);
+  if (payload.cost_usd != null) bits.push(`$${Number(payload.cost_usd).toFixed(6)}`);
+  if (bits.length) {
+    rec.meta.textContent = bits.join("  ·  ");
+    rec.meta.hidden = false;
+  }
+}
+
+function activeTurn() {
+  for (const rec of turns.values()) if (!rec.done) return rec;
+  return null;
+}
+
 function setStreaming(on) {
   state.streaming = on;
   el("btn-send").disabled = on;
   el("btn-stop").disabled = !on;
   el("cm-state").textContent = on ? "生成中" : "空闲";
-  if (!on && state.currentTurn) {
-    state.currentTurn.classList.remove("caret");
-    state.currentTurn = null;
-  }
 }
 
 async function send() {
   const box = el("msg");
   const text = box.value.trim();
   if (!text) return;
-  if (!state.gateway.connected) return toast("网关未连接", "bad");
+  if (!state.gateway.connected) {
+    // 带上具体原因，否则「网关未连接」看不出是会话过期还是网关真挂了。
+    return toast(state.gateway.error || "网关未连接", "bad");
+  }
   addTurn("user", text);
   box.value = "";
   box.style.height = "auto";
@@ -642,7 +756,14 @@ async function send() {
   try {
     await api("/api/chat", { method: "POST", body: JSON.stringify({ message: text }) });
   } catch (err) {
-    addTurn("system", `发送失败: ${err.message}`);
+    // 请求本身没送出去，网关不会有任何事件，得自己把占位轮次收成失败态。
+    const rec = activeTurn();
+    if (rec) {
+      rec.body.textContent = `发送失败: ${err.message}`;
+      finishTurn(rec, "error");
+    } else {
+      addTurn("system", `发送失败: ${err.message}`);
+    }
     setStreaming(false);
   }
 }
@@ -656,7 +777,10 @@ el("btn-stop").addEventListener("click", async () => {
     toast(err.message, "bad");
   }
 });
-el("btn-clear").addEventListener("click", () => (el("log").innerHTML = ""));
+el("btn-clear").addEventListener("click", () => {
+  el("log").innerHTML = "";
+  turns.clear(); // 否则旧档案还指着已被删掉的节点
+});
 
 el("btn-history").addEventListener("click", async (event) => {
   const btn = event.currentTarget;
@@ -664,6 +788,7 @@ el("btn-history").addEventListener("click", async (event) => {
     busy(btn, true);
     const data = await api("/api/chat/history?limit=40");
     el("log").innerHTML = "";
+    turns.clear();
     for (const m of data.messages || []) {
       const role = m.role || m.author || "assistant";
       const text = typeof m.content === "string"
@@ -693,9 +818,16 @@ msgBox.addEventListener("keydown", (event) => {
 
 /* ------------------------------------------------------- gateway events */
 
+let bridgeRetry = 0; // 连续重连次数，用于退避
+
 function connectBridge() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const sock = new WebSocket(`${proto}://${location.host}/ws`);
+
+  sock.onopen = () => {
+    bridgeRetry = 0;
+    state.gateway.error = null;
+  };
 
   sock.onmessage = (event) => {
     let frame;
@@ -714,44 +846,118 @@ function connectBridge() {
 
     const name = frame.event || "";
     const payload = frame.payload || {};
+    const turnId = payload.turn_id || payload.task_id || "";
+    if (turnId) adoptTurnId(turnId);
+
+    // 排队 / 受理：此时还没有任何输出，先把 bubble 立起来给状态。
+    if (name === "task.queued") {
+      const rec = ensureTurn(turnId);
+      setPhase(rec, "queued");
+      if (payload.queue_depth > 1) {
+        rec.phaseText.textContent = `已排队 · 第 ${payload.queue_position}/${payload.queue_depth}`;
+      }
+      return;
+    }
+    if (name === "task.running") {
+      setPhase(ensureTurn(turnId), "running");
+      return;
+    }
+
+    // 网关自己的状态机，最权威，直接照搬 to_state。
+    if (name.endsWith("state_change")) {
+      const rec = ensureTurn(turnId);
+      const to = payload.to_state || "";
+      if (to === "done") finishTurn(rec, "done", payload);
+      else setPhase(rec, to);
+      return;
+    }
+
+    // 思考流：折叠在「思考过程」里，不与正文混排。
+    if (name.endsWith("thinking")) {
+      const rec = ensureTurn(turnId);
+      setPhase(rec, "thinking");
+      const piece = payload.text ?? payload.delta ?? "";
+      if (piece) {
+        rec.reason.hidden = false;
+        rec.reasonBody.textContent += piece;
+      }
+      return;
+    }
 
     if (name.endsWith("text_delta") || name.endsWith("message_delta")) {
-      const delta = payload.delta ?? payload.text ?? "";
-      if (!state.currentTurn) {
-        state.currentTurn = addTurn("assistant", "");
-        state.currentTurn.classList.add("caret");
-      }
-      state.currentTurn.textContent += delta;
+      const rec = ensureTurn(turnId);
+      setPhase(rec, "streaming");
+      rec.body.textContent += payload.delta ?? payload.text ?? "";
       el("log").scrollTop = el("log").scrollHeight;
       return;
     }
+
     if (name.endsWith("tool_call") || name.endsWith("tool.start")) {
-      const target = state.currentTurn || addTurn("assistant", "");
-      state.currentTurn = target;
+      const rec = ensureTurn(turnId);
       const chip = document.createElement("div");
       chip.className = "tool";
-      chip.textContent = `⚙ ${payload.name || payload.tool || "tool"}`;
-      target.appendChild(chip);
+      chip.textContent = payload.name || payload.tool || "tool";
+      rec.body.appendChild(chip);
       return;
     }
-    if (name.endsWith("message_complete") || name.endsWith("turn_complete") ||
-        name.endsWith("idle") || name.endsWith("aborted")) {
-      if (payload.text && state.currentTurn && !state.currentTurn.textContent) {
-        state.currentTurn.textContent = payload.text;
+
+    // done 是真正的收尾事件（不是 message_complete / turn_complete，那两个
+    // 网关压根不发）。它带 text_snapshot，用来兜住漏掉的增量。
+    if (name.endsWith("session.event.done") || name === "session.event.done") {
+      const rec = ensureTurn(turnId);
+      const snapshot = payload.text_snapshot ?? payload.text ?? "";
+      if (snapshot && snapshot.length > rec.body.textContent.length) {
+        rec.body.textContent = snapshot;
       }
+      if (payload.reasoning_content && !rec.reasonBody.textContent) {
+        rec.reason.hidden = false;
+        rec.reasonBody.textContent = payload.reasoning_content;
+      }
+      finishTurn(rec, "done", payload);
       setStreaming(false);
       return;
     }
-    if (name.endsWith("error")) {
-      addTurn("system", payload.message || JSON.stringify(payload));
+
+    if (name.endsWith("aborted") || name === "task.aborted") {
+      finishTurn(ensureTurn(turnId), "aborted", payload);
+      setStreaming(false);
+      return;
+    }
+
+    if (name === "task.failed" || name.endsWith("error")) {
+      const rec = turns.get(turnId) || activeTurn();
+      if (rec) {
+        if (!rec.body.textContent) {
+          rec.body.textContent = payload.message || payload.error || "网关未说明失败原因";
+        }
+        finishTurn(rec, "error", payload);
+      } else {
+        addTurn("system", payload.message || JSON.stringify(payload));
+      }
       setStreaming(false);
     }
   };
 
-  sock.onclose = () => {
+  sock.onclose = (event) => {
     state.gateway.connected = false;
+
+    // 1008 = 后端拒绝握手，只会因为 session 失效。无脑重连的话会永远卡在
+    // 「连接中」，用户根本不知道该重新登录 —— 直接把人送去登录页。
+    if (event.code === 1008) {
+      state.gateway.error = "会话已过期，正在跳转登录…";
+      renderTop();
+      // 控制台是单页应用，根路径即全部界面，不需要 next 回跳参数。
+      setTimeout(() => location.replace("/login"), 900);
+      return;
+    }
+
+    // 其余情况（网关重启、网络抖动）退避重连，并把重试进度显示出来，
+    // 不要静默地假装还在连。
+    bridgeRetry = Math.min(bridgeRetry + 1, 6);
+    const wait = Math.min(1600 * bridgeRetry, 10000);
+    state.gateway.error = `连接中断，${Math.round(wait / 1000)}s 后重试（第 ${bridgeRetry} 次）`;
     renderTop();
-    setTimeout(connectBridge, 1600);
+    setTimeout(connectBridge, wait);
   };
 }
 
