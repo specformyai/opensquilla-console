@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SQUILLA CONSOLE</title>
+<link rel="icon" type="image/png" sizes="32x32" href="/icon/icon-32.png" />
+<link rel="icon" type="image/png" sizes="16x16" href="/icon/icon-16.png" />
+<link rel="icon" type="image/png" sizes="192x192" href="/icon/icon-192.png" />
+<link rel="apple-touch-icon" sizes="180x180" href="/icon/icon-180.png" />
+<link rel="shortcut icon" href="/favicon.ico" />
+<link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+
+<canvas id="field"></canvas>
+<div class="bloom bloom--a"></div>
+<div class="bloom bloom--b"></div>
+<div class="grain"></div>
+
+<div class="shell">
+
+  <!-- ------------------------------------------------------------- rail -->
+  <nav class="rail">
+    <div class="mark"><i data-ic="square-terminal"></i></div>
+    <div class="rail__wordmark">SQUILLA</div>
+
+    <div class="rail__nav">
+      <button class="navbtn is-on" data-tab="chat" type="button">
+        <i data-ic="terminal"></i><span class="navbtn__tip">对话终端</span>
+      </button>
+      <button class="navbtn" data-tab="keys" type="button">
+        <i data-ic="key"></i><span class="navbtn__tip">凭据管理</span>
+      </button>
+      <button class="navbtn" data-tab="models" type="button">
+        <i data-ic="layers"></i><span class="navbtn__tip">模型目录</span>
+      </button>
+    </div>
+
+    <button class="navbtn navbtn--out" id="btn-logout" type="button" hidden>
+      <i data-ic="log-out"></i><span class="navbtn__tip">退出登录</span>
+    </button>
+
+    <div class="pulse" id="pulse" title="网关连接状态"></div>
+  </nav>
+
+  <!-- ------------------------------------------------------------ stage -->
+  <main class="stage">
+
+    <header class="topbar">
+      <div class="title">
+        <h1>SQUILLA CONSOLE</h1>
+        <span>OPENSQUILLA / OPERATOR</span>
+      </div>
+      <dl class="readouts">
+        <div class="readout"><dt>网关</dt><dd id="ro-gw">连接中</dd></div>
+        <div class="readout"><dt>提供方</dt><dd id="ro-provider">—</dd></div>
+        <div class="readout"><dt>当前模型</dt><dd id="ro-model">—</dd></div>
+        <div class="readout"><dt>凭据</dt><dd id="ro-key">—</dd></div>
+      </dl>
+    </header>
+
+    <div class="panels">
+
+      <!-- ------------------------------------------------------- chat -->
+      <section class="panel panel--chat is-live enter" data-panel="chat">
+        <div class="tty">
+          <div class="tty__head">
+            <i data-ic="terminal"></i>
+            <span id="tty-session">agent:main:webchat:default</span>
+            <span class="spacer"></span>
+            <button class="btn btn--ghost btn--tiny only-mobile" id="btn-aside" type="button">
+              <i data-ic="sliders-horizontal"></i>面板
+            </button>
+            <button class="btn btn--ghost btn--tiny" id="btn-history" type="button">
+              <i data-ic="clock"></i>拉取历史
+            </button>
+            <button class="btn btn--ghost btn--tiny" id="btn-clear" type="button">
+              <i data-ic="trash-2"></i>清屏
+            </button>
+          </div>
+
+          <div class="log" id="log"></div>
+
+          <div class="composer">
+            <div class="composer__row">
+              <span class="prompt">&gt;</span>
+              <textarea id="msg" rows="1" placeholder="输入消息… Enter 发送 / Shift+Enter 换行"></textarea>
+              <button class="btn btn--go" id="btn-send" type="button">
+                <i data-ic="send"></i>发送
+              </button>
+              <button class="btn btn--ghost" id="btn-stop" type="button" disabled>
+                <i data-ic="x"></i>中断
+              </button>
+            </div>
+            <div class="composer__meta">
+              <span id="cm-model">模型 —</span>
+              <span class="dot"></span>
+              <span id="cm-key">凭据 —</span>
+              <span class="dot"></span>
+              <span id="cm-state">空闲</span>
+            </div>
+          </div>
+        </div>
+
+        <aside class="aside">
+          <div class="card">
+            <div class="card__head"><i data-ic="zap"></i>快速切换<span class="spacer"></span></div>
+            <div class="card__body" style="display:grid;gap:10px;">
+              <div class="field">
+                <label for="q-key">凭据</label>
+                <select id="q-key"></select>
+              </div>
+              <div class="field">
+                <label for="q-model">模型</label>
+                <select id="q-model"></select>
+              </div>
+              <button class="btn btn--hot" id="btn-probe-active" type="button">
+                <i data-ic="activity"></i>一键测活
+              </button>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card__head"><i data-ic="gauge"></i>网关状态</div>
+            <div class="card__body">
+              <div class="kv" id="gw-kv"></div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card__head"><i data-ic="activity"></i>最近测活</div>
+            <div class="card__body">
+              <div class="probe" id="probe-last">尚未测活。</div>
+            </div>
+          </div>
+        </aside>
+      </section>
+
+      <!-- ------------------------------------------------------- keys -->
+      <section class="panel panel--keys enter" data-panel="keys">
+        <div class="wide">
+          <div class="sect">
+            <h2>凭据库</h2>
+            <p>多 KEY 并存 · 备注 · 一键激活 · 固定问题测活</p>
+            <span class="spacer"></span>
+            <button class="btn btn--hot btn--tiny" id="btn-test-all" type="button">
+              <i data-ic="activity"></i>全部测活
+            </button>
+            <button class="btn btn--ghost btn--tiny" id="btn-keys-refresh" type="button">
+              <i data-ic="refresh-cw"></i>刷新
+            </button>
+          </div>
+
+          <div class="forge">
+            <div class="field">
+              <label for="f-note">备注</label>
+              <input id="f-note" placeholder="例如 CPA 主力" />
+            </div>
+            <div class="field">
+              <label for="f-provider">提供方 ID</label>
+              <select id="f-provider">
+                <option value="custom">custom · Custom OpenAI-compatible endpoint</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="f-base">BASE URL</label>
+              <input id="f-base" placeholder="https://host/v1" />
+            </div>
+            <div class="field">
+              <label for="f-key">API KEY</label>
+              <input id="f-key" type="password" placeholder="sk-…" />
+            </div>
+            <div class="field">
+              <label for="f-model">默认模型</label>
+              <input id="f-model" placeholder="可留空，稍后从目录选" />
+            </div>
+            <button class="btn btn--go" id="btn-key-add" type="button">
+              <i data-ic="plus"></i>加入凭据库
+            </button>
+          </div>
+
+          <div class="keys" id="keys"></div>
+        </div>
+      </section>
+
+      <!-- ------------------------------------------------------ models -->
+      <section class="panel panel--models enter" data-panel="models">
+        <div class="wide">
+          <div class="sect">
+            <h2>模型目录</h2>
+            <p>点击卡片即切换网关主模型</p>
+            <span class="spacer"></span>
+            <button class="btn btn--ghost btn--tiny" id="btn-models-gw" type="button">
+              <i data-ic="database"></i>网关列表
+            </button>
+            <button class="btn btn--go btn--tiny" id="btn-models-ep" type="button">
+              <i data-ic="refresh-cw"></i>从端点拉取
+            </button>
+          </div>
+
+          <div class="modelbar">
+            <div class="finder">
+              <i data-ic="search"></i>
+              <input id="m-filter" placeholder="过滤模型 ID / 提供方…" />
+              <button class="finder__clear" id="m-clear" type="button" title="清空过滤">
+                <i data-ic="x"></i>
+              </button>
+            </div>
+            <span class="chip chip--on" id="m-current"><i data-ic="check"></i><span>当前 —</span></span>
+            <span class="chip" id="m-count"><i data-ic="layers"></i><span>0 个模型</span></span>
+          </div>
+
+          <div class="models" id="models"></div>
+        </div>
+      </section>
+
+    </div>
+  </main>
+</div>
+
+<div class="toasts" id="toasts"></div>
+
+<!-- ---------------------------------------------- credential editor -->
+<div class="sheet" id="edit-sheet" hidden>
+  <div class="sheet__veil" data-close="1"></div>
+  <div class="sheet__body" role="dialog" aria-modal="true" aria-labelledby="edit-title">
+    <div class="sheet__head">
+      <i data-ic="pencil"></i>
+      <h3 id="edit-title">编辑凭据</h3>
+      <span class="spacer"></span>
+      <button class="btn btn--ghost btn--tiny" id="edit-close" type="button" aria-label="关闭">
+        <i data-ic="x"></i>
+      </button>
+    </div>
+    <div class="forge forge--sheet">
+      <div class="field">
+        <label for="e-note">备注</label>
+        <input id="e-note" placeholder="例如 TokenRhythm 邀请号 1" />
+      </div>
+      <div class="field">
+        <label for="e-provider">提供方 ID</label>
+        <select id="e-provider"></select>
+      </div>
+      <div class="field">
+        <label for="e-base">BASE URL</label>
+        <input id="e-base" placeholder="https://host/v1" />
+      </div>
+      <div class="field">
+        <label for="e-key">API KEY</label>
+        <input id="e-key" type="password" placeholder="留空 = 不改动现有 KEY" />
+      </div>
+      <div class="field">
+        <label for="e-model">默认模型</label>
+        <input id="e-model" placeholder="可留空" />
+      </div>
+    </div>
+    <div class="sheet__acts">
+      <button class="btn btn--go" id="edit-save" type="button">
+        <i data-ic="check"></i>保存
+      </button>
+      <button class="btn btn--ghost" id="edit-cancel" type="button">
+        <i data-ic="x"></i>取消
+      </button>
+    </div>
+  </div>
+</div>
+
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>

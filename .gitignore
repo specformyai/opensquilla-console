@@ -1,0 +1,5 @@
+# 运行时凭据库：明文 API KEY，绝不入库
+data/
+*.pyc
+__pycache__/
+.venv/

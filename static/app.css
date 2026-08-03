@@ -1,0 +1,1422 @@
+/* ==========================================================================
+   SQUILLA CONSOLE
+   Visual system: "spectral operator terminal".
+   The mantis shrimp (Squilla) sees more of the spectrum than any other animal —
+   so the palette is a full spectral sweep laid over near-black, and the type is
+   an oversized grotesk paired with a hard monospace for machine surfaces.
+   ========================================================================== */
+
+@font-face {
+  font-family: "SpaceGrotesk";
+  src: local("Space Grotesk");
+  font-display: swap;
+}
+
+:root {
+  --ink-000: #05060a;
+  --ink-050: #080a11;
+  --ink-100: #0c0f18;
+  --ink-200: #12161f;
+  --ink-300: #1a1f2b;
+  --ink-400: #262d3c;
+  --ink-500: #3a4356;
+
+  --pearl: #f2f4f8;
+  --dust: #9aa4b8;
+  --dust-dim: #5d6779;
+
+  --spec-cyan: #35f2e6;
+  --spec-blue: #4a7dff;
+  --spec-violet: #9b5cff;
+  --spec-magenta: #ff3ea5;
+  --spec-amber: #ffb03a;
+  --spec-lime: #a6ff4d;
+
+  --ok: #35f2a8;
+  --warn: #ffb03a;
+  --bad: #ff4d6a;
+
+  --edge: color-mix(in oklab, var(--pearl) 9%, transparent);
+  --edge-hot: color-mix(in oklab, var(--spec-cyan) 34%, transparent);
+
+  --sans: "SpaceGrotesk", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI",
+    "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --mono: "JetBrains Mono", "SFMono-Regular", "Menlo", "Consolas",
+    "Liberation Mono", monospace;
+
+  /* Physics: overshoot springs for entrances, tight ease for state flips. */
+  --spring: cubic-bezier(0.16, 1.24, 0.3, 1);
+  --spring-soft: cubic-bezier(0.22, 1.1, 0.36, 1);
+  --snap: cubic-bezier(0.4, 0, 0.2, 1);
+
+  --rail: 78px;
+  --gutter: 20px;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  margin: 0;
+  background: var(--ink-000);
+  color: var(--pearl);
+  font-family: var(--sans);
+  font-feature-settings: "ss01", "cv01", "tnum";
+  overflow: hidden;
+}
+
+body {
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+::selection { background: color-mix(in oklab, var(--spec-cyan) 35%, transparent); }
+
+/* ---------------------------------------------------------------- ambience */
+
+#field {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+.grain {
+  position: fixed;
+  inset: -50%;
+  z-index: 1;
+  pointer-events: none;
+  opacity: 0.035;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='140' height='140'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3'/></filter><rect width='140' height='140' filter='url(%23n)'/></svg>");
+  animation: grainDrift 7s steps(6) infinite;
+  mix-blend-mode: overlay;
+}
+
+@keyframes grainDrift {
+  0%   { transform: translate(0, 0); }
+  20%  { transform: translate(-3%, 2%); }
+  40%  { transform: translate(2%, -3%); }
+  60%  { transform: translate(-2%, -2%); }
+  80%  { transform: translate(3%, 1%); }
+  100% { transform: translate(0, 0); }
+}
+
+.bloom {
+  position: fixed;
+  z-index: 0;
+  border-radius: 50%;
+  filter: blur(90px);
+  pointer-events: none;
+  opacity: 0.5;
+}
+.bloom--a {
+  width: 46vw; height: 46vw;
+  left: -12vw; top: -16vw;
+  background: radial-gradient(circle, color-mix(in oklab, var(--spec-violet) 55%, transparent), transparent 70%);
+  animation: drift 26s var(--spring-soft) infinite alternate;
+}
+.bloom--b {
+  width: 38vw; height: 38vw;
+  right: -8vw; bottom: -14vw;
+  background: radial-gradient(circle, color-mix(in oklab, var(--spec-cyan) 45%, transparent), transparent 70%);
+  animation: drift 32s var(--spring-soft) infinite alternate-reverse;
+}
+
+@keyframes drift {
+  from { transform: translate3d(0, 0, 0) scale(1); }
+  to   { transform: translate3d(6vw, 5vh, 0) scale(1.18); }
+}
+
+/* ------------------------------------------------------------------- shell */
+
+.shell {
+  position: relative;
+  z-index: 2;
+  display: grid;
+  grid-template-columns: var(--rail) minmax(0, 1fr);
+  height: 100vh;
+}
+
+/* rail */
+
+.rail {
+  position: relative;
+  z-index: 5; /* tooltips overhang the stage — keep the rail's layer on top */
+  border-right: 1px solid var(--edge);
+  background: color-mix(in oklab, var(--ink-050) 82%, transparent);
+  backdrop-filter: blur(14px);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 18px 0;
+  gap: 22px;
+}
+
+.mark {
+  width: 40px; height: 40px;
+  display: grid;
+  place-items: center;
+  border-radius: 13px;
+  background: linear-gradient(145deg, var(--spec-cyan), var(--spec-violet) 55%, var(--spec-magenta));
+  color: var(--ink-000);
+  box-shadow: 0 0 0 1px color-mix(in oklab, var(--pearl) 14%, transparent),
+              0 12px 34px -14px color-mix(in oklab, var(--spec-violet) 90%, transparent);
+  transition: transform 0.6s var(--spring);
+}
+.mark:hover { transform: rotate(-8deg) scale(1.07); }
+.mark .ic { width: 20px; height: 20px; stroke-width: 2.1; }
+
+.rail__wordmark {
+  writing-mode: vertical-rl;
+  font-size: 10px;
+  letter-spacing: 0.42em;
+  text-transform: uppercase;
+  color: var(--dust-dim);
+  margin-top: 2px;
+}
+
+.rail__nav {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: auto;
+  margin-bottom: auto;
+}
+
+.navbtn {
+  position: relative;
+  width: 44px; height: 44px;
+  display: grid;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: 14px;
+  background: transparent;
+  color: var(--dust-dim);
+  cursor: pointer;
+  transition: color 0.3s var(--snap), background 0.3s var(--snap),
+              border-color 0.3s var(--snap), transform 0.5s var(--spring);
+}
+.navbtn:hover { color: var(--pearl); background: var(--ink-200); transform: translateY(-2px); }
+.navbtn.is-on {
+  color: var(--ink-000);
+  background: linear-gradient(140deg, var(--spec-cyan), var(--spec-blue));
+  border-color: color-mix(in oklab, var(--spec-cyan) 45%, transparent);
+}
+.navbtn.is-on::after {
+  content: "";
+  position: absolute;
+  left: -10px; top: 50%;
+  width: 3px; height: 22px;
+  border-radius: 3px;
+  background: var(--spec-cyan);
+  transform: translateY(-50%);
+  box-shadow: 0 0 16px var(--spec-cyan);
+}
+.navbtn .ic { width: 19px; height: 19px; }
+
+.navbtn__tip {
+  position: absolute;
+  left: calc(100% + 12px);
+  padding: 5px 9px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+  background: var(--ink-300);
+  border: 1px solid var(--edge);
+  border-radius: 7px;
+  box-shadow: 0 12px 28px -14px #000;
+  opacity: 0;
+  transform: translateX(-6px);
+  transition: opacity 0.24s var(--snap), transform 0.34s var(--spring);
+  pointer-events: none;
+  z-index: 60;
+}
+.navbtn:hover .navbtn__tip { opacity: 1; transform: translateX(0); }
+
+/* Logout sits apart from the tab group: it leaves the console rather than
+   navigating within it, so it lives down by the status pulse and warms to red
+   on hover instead of the spectral cyan the tabs use. */
+.navbtn--out { margin-bottom: 12px; }
+.navbtn--out:hover {
+  color: var(--bad);
+  background: color-mix(in oklab, var(--bad) 12%, transparent);
+}
+
+.pulse {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--bad);
+  box-shadow: 0 0 0 0 color-mix(in oklab, var(--bad) 70%, transparent);
+  transition: background 0.4s var(--snap);
+}
+.pulse.is-live {
+  background: var(--ok);
+  animation: beat 2.4s ease-out infinite;
+}
+@keyframes beat {
+  0%   { box-shadow: 0 0 0 0 color-mix(in oklab, var(--ok) 75%, transparent); }
+  70%  { box-shadow: 0 0 0 11px transparent; }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+
+/* ------------------------------------------------------------------- stage */
+
+.stage {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  padding: 16px var(--gutter) 14px;
+  border-bottom: 1px solid var(--edge);
+}
+
+.title {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  min-width: 0;
+}
+
+.title h1 {
+  margin: 0;
+  font-size: clamp(19px, 2.3vw, 30px);
+  font-weight: 600;
+  letter-spacing: -0.035em;
+  line-height: 0.95;
+  background: linear-gradient(96deg, var(--pearl) 8%, var(--spec-cyan) 46%, var(--spec-violet) 78%, var(--spec-magenta));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  background-size: 220% 100%;
+  animation: sweep 13s linear infinite;
+}
+@keyframes sweep {
+  from { background-position: 0% 50%; }
+  to   { background-position: 220% 50%; }
+}
+
+.title span {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.24em;
+  text-transform: uppercase;
+  color: var(--dust-dim);
+  white-space: nowrap;
+}
+
+.readouts {
+  margin-left: auto;
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.readout {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 7px 12px;
+  min-width: 104px;
+  border: 1px solid var(--edge);
+  border-radius: 11px;
+  background: color-mix(in oklab, var(--ink-100) 76%, transparent);
+}
+.readout dt {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--dust-dim);
+}
+.readout dd {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--pearl);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 190px;
+}
+.readout dd.is-ok { color: var(--ok); }
+.readout dd.is-bad { color: var(--bad); }
+
+/* ------------------------------------------------------------------ panels */
+
+.panels { flex: 1; min-height: 0; position: relative; }
+
+.panel {
+  position: absolute;
+  inset: 0;
+  display: none;
+  min-height: 0;
+}
+.panel.is-live { display: grid; }
+
+.panel--chat { grid-template-columns: minmax(0, 1fr) 320px; }
+.panel--keys, .panel--models { grid-template-columns: minmax(0, 1fr); }
+
+@media (max-width: 1180px) {
+  .panel--chat { grid-template-columns: minmax(0, 1fr); }
+  .panel--chat .aside { display: none; }
+}
+
+.enter > * { animation: rise 0.66s var(--spring) both; }
+.enter > *:nth-child(2) { animation-delay: 0.05s; }
+.enter > *:nth-child(3) { animation-delay: 0.1s; }
+@keyframes rise {
+  from { opacity: 0; transform: translate3d(0, 16px, 0) scale(0.985); }
+  to   { opacity: 1; transform: none; }
+}
+
+/* ------------------------------------------------------------------- chat */
+
+.tty {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  border-right: 1px solid var(--edge);
+}
+
+.tty__head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px var(--gutter);
+  border-bottom: 1px solid var(--edge);
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--dust-dim);
+  background: repeating-linear-gradient(
+    -45deg,
+    transparent 0 6px,
+    color-mix(in oklab, var(--pearl) 2%, transparent) 6px 7px
+  );
+}
+.tty__head .ic { width: 15px; height: 15px; color: var(--spec-cyan); }
+.tty__head .spacer { margin-left: auto; }
+
+.log {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 20px var(--gutter) 26px;
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.72;
+  scroll-behavior: smooth;
+}
+.log::-webkit-scrollbar { width: 9px; }
+.log::-webkit-scrollbar-track { background: transparent; }
+.log::-webkit-scrollbar-thumb {
+  background: var(--ink-400);
+  border-radius: 9px;
+  border: 2px solid var(--ink-000);
+}
+
+.turn {
+  margin-bottom: 18px;
+  animation: rise 0.5s var(--spring) both;
+}
+
+.turn__tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 10px;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--dust-dim);
+  margin-bottom: 5px;
+}
+.turn__tag .ic { width: 13px; height: 13px; }
+.turn--me .turn__tag { color: var(--spec-cyan); }
+.turn--ai .turn__tag { color: var(--spec-violet); }
+.turn--sys .turn__tag { color: var(--warn); }
+
+.turn__body {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  padding-left: 14px;
+  border-left: 1px solid var(--ink-400);
+}
+.turn--me .turn__body { border-left-color: color-mix(in oklab, var(--spec-cyan) 55%, transparent); }
+.turn--ai .turn__body { border-left-color: color-mix(in oklab, var(--spec-violet) 55%, transparent); }
+.turn--sys .turn__body { border-left-color: color-mix(in oklab, var(--warn) 55%, transparent); color: var(--dust); }
+
+.turn__body .tool {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 2px 0;
+  padding: 2px 8px;
+  font-size: 11px;
+  border: 1px dashed color-mix(in oklab, var(--spec-amber) 40%, transparent);
+  border-radius: 7px;
+  color: var(--spec-amber);
+}
+
+.caret::after {
+  content: "▍";
+  color: var(--spec-cyan);
+  animation: blink 1.05s steps(2) infinite;
+}
+@keyframes blink { 50% { opacity: 0; } }
+
+.composer {
+  border-top: 1px solid var(--edge);
+  padding: 14px var(--gutter) 18px;
+  background: color-mix(in oklab, var(--ink-050) 70%, transparent);
+}
+
+.composer__row {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+}
+
+.prompt {
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--spec-cyan);
+  padding-bottom: 12px;
+  user-select: none;
+}
+
+textarea#msg {
+  flex: 1;
+  min-height: 46px;
+  max-height: 190px;
+  resize: none;
+  padding: 12px 14px;
+  color: var(--pearl);
+  background: var(--ink-100);
+  border: 1px solid var(--edge);
+  border-radius: 12px;
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.6;
+  outline: none;
+  transition: border-color 0.3s var(--snap), box-shadow 0.4s var(--snap),
+              background 0.3s var(--snap);
+}
+textarea#msg:focus {
+  border-color: var(--edge-hot);
+  background: var(--ink-200);
+  box-shadow: 0 0 0 4px color-mix(in oklab, var(--spec-cyan) 10%, transparent);
+}
+textarea#msg::placeholder { color: var(--dust-dim); }
+
+.composer__meta {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-top: 10px;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--dust-dim);
+}
+.composer__meta .dot { width: 4px; height: 4px; border-radius: 50%; background: var(--ink-500); }
+
+/* ------------------------------------------------------------------ aside */
+
+.aside {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 13px;
+  padding: 15px 15px 22px; /* trailing pad: last card must not sit flush on the fold */
+  overflow-y: auto;
+  border-left: 1px solid var(--edge);
+}
+
+.card {
+  flex: 0 0 auto; /* in the flex sidebar, cards keep natural height — without
+                     this they shrink below their content and clip it, and the
+                     column never scrolls because nothing overflows */
+  border: 1px solid var(--edge);
+  border-radius: 15px;
+  background: color-mix(in oklab, var(--ink-100) 74%, transparent);
+  overflow: hidden;
+  transition: border-color 0.4s var(--snap), transform 0.6s var(--spring);
+}
+.card:hover { border-color: color-mix(in oklab, var(--pearl) 16%, transparent); }
+
+.card__head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 11px 13px;
+  border-bottom: 1px solid var(--edge);
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--dust);
+}
+.card__head .ic { width: 14px; height: 14px; color: var(--spec-cyan); }
+.card__head .spacer { margin-left: auto; }
+.card__body { padding: 12px 13px; }
+
+.kv { display: grid; gap: 8px; }
+.kv__row {
+  display: grid;
+  grid-template-columns: 66px minmax(0, 1fr);
+  align-items: baseline;
+  gap: 10px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+.kv__row b {
+  color: var(--dust-dim);
+  font-weight: 400;
+  letter-spacing: 0.08em;
+  white-space: nowrap;
+}
+.kv__row span {
+  color: var(--pearl);
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+/* ----------------------------------------------------------------- buttons */
+
+.btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 9px 15px;
+  border: 1px solid var(--edge);
+  border-radius: 11px;
+  background: var(--ink-200);
+  color: var(--pearl);
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  cursor: pointer;
+  overflow: hidden;
+  transition: transform 0.45s var(--spring), border-color 0.3s var(--snap),
+              background 0.3s var(--snap), color 0.3s var(--snap);
+}
+.btn::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(115deg, transparent 20%, color-mix(in oklab, var(--pearl) 16%, transparent) 50%, transparent 80%);
+  transform: translateX(-130%);
+  transition: transform 0.75s var(--spring-soft);
+}
+.btn:hover { transform: translateY(-2px); border-color: var(--edge-hot); }
+.btn:hover::before { transform: translateX(130%); }
+.btn:active { transform: translateY(0) scale(0.975); }
+.btn:disabled { opacity: 0.42; cursor: not-allowed; transform: none; }
+.btn .ic { width: 15px; height: 15px; }
+
+.btn--go {
+  background: linear-gradient(135deg, var(--spec-cyan), var(--spec-blue));
+  border-color: transparent;
+  color: var(--ink-000);
+  font-weight: 600;
+}
+.btn--hot {
+  background: linear-gradient(135deg, var(--spec-magenta), var(--spec-violet));
+  border-color: transparent;
+  color: var(--pearl);
+}
+.btn--ghost { background: transparent; }
+.btn--tiny { padding: 6px 10px; font-size: 10px; border-radius: 9px; }
+.btn--icon { padding: 7px; }
+.btn--icon .ic { width: 14px; height: 14px; }
+
+.btn.is-busy { pointer-events: none; }
+.btn.is-busy .ic--spin { animation: spin 0.85s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ------------------------------------------------------------------ inputs */
+
+.field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.field > label {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--dust-dim);
+}
+.field input, .field select {
+  padding: 10px 12px;
+  color: var(--pearl);
+  background: var(--ink-100);
+  border: 1px solid var(--edge);
+  border-radius: 10px;
+  font-family: var(--mono);
+  font-size: 12px;
+  outline: none;
+  transition: border-color 0.3s var(--snap), box-shadow 0.4s var(--snap);
+}
+.field input:focus, .field select:focus {
+  border-color: var(--edge-hot);
+  box-shadow: 0 0 0 4px color-mix(in oklab, var(--spec-cyan) 9%, transparent);
+}
+/* appearance:none strips the native arrow, which left the select visually
+   identical to the text inputs above and below it. Draw the chevron back in as
+   a background image and reserve room for it on the right. */
+.field select {
+  appearance: none;
+  cursor: pointer;
+  padding-right: 32px;
+  /* The shorthand on .field input above sets background-color, so the chevron
+     has to be layered on with the longhand or it gets wiped. */
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2335f2e6' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 11px center;
+  background-size: 13px 13px;
+}
+
+/* ------------------------------------------------------------------- keys */
+
+.wide {
+  min-width: 0;
+  overflow-y: auto;
+  padding: 18px var(--gutter) 34px;
+}
+
+.sect {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 0 0 14px;
+}
+.sect h2 {
+  margin: 0;
+  font-size: clamp(15px, 1.5vw, 19px);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+.sect p {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.1em;
+  color: var(--dust-dim);
+}
+.sect .spacer { margin-left: auto; }
+
+.forge {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(168px, 1fr));
+  gap: 12px;
+  align-items: end;
+  padding: 15px;
+  margin-bottom: 20px;
+  border: 1px solid var(--edge);
+  border-radius: 15px;
+  background:
+    linear-gradient(135deg, color-mix(in oklab, var(--spec-violet) 7%, transparent), transparent 55%),
+    color-mix(in oklab, var(--ink-100) 78%, transparent);
+}
+
+.keys {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(324px, 1fr));
+  align-items: start; /* cards hug their content — a short probe must not
+                         leave dead space above the button row */
+  gap: 13px;
+}
+
+.keycard {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+  padding: 15px;
+  border: 1px solid var(--edge);
+  border-radius: 15px;
+  background: color-mix(in oklab, var(--ink-100) 76%, transparent);
+  transition: transform 0.6s var(--spring), border-color 0.35s var(--snap),
+              box-shadow 0.5s var(--snap);
+  animation: rise 0.6s var(--spring) both;
+}
+.keycard:hover {
+  transform: translateY(-4px);
+  border-color: color-mix(in oklab, var(--pearl) 18%, transparent);
+  box-shadow: 0 26px 54px -30px #000;
+}
+.keycard.is-active {
+  border-color: color-mix(in oklab, var(--spec-cyan) 52%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in oklab, var(--spec-cyan) 22%, transparent),
+              0 26px 54px -32px color-mix(in oklab, var(--spec-cyan) 60%, transparent);
+}
+.keycard.is-active::before {
+  content: "";
+  position: absolute;
+  left: 15px; right: 15px; top: 0;
+  height: 2px;
+  border-radius: 2px;
+  background: linear-gradient(90deg, var(--spec-cyan), var(--spec-violet), var(--spec-magenta));
+}
+
+.keycard__top {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+.keycard__note {
+  margin: 0;
+  font-size: 14.5px;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  overflow-wrap: anywhere;
+}
+.keycard__provider {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--dust-dim);
+  margin-top: 3px;
+}
+/* A provider id outside the gateway's catalogue only fails at 激活 time, well
+   after the mistake was made — flag it on the card instead. */
+.keycard__provider.is-bad {
+  color: var(--spec-amber);
+  text-transform: none;
+  letter-spacing: 0.04em;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--edge);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--dust);
+  white-space: nowrap;
+}
+.chip .ic { width: 12px; height: 12px; }
+.chip--on { color: var(--ink-000); background: var(--spec-cyan); border-color: transparent; font-weight: 600; }
+.chip--ok { color: var(--ok); border-color: color-mix(in oklab, var(--ok) 40%, transparent); }
+.chip--bad { color: var(--bad); border-color: color-mix(in oklab, var(--bad) 40%, transparent); }
+.chip--ghost { color: var(--dust-dim); opacity: 0.6; }
+.chip--wait { color: var(--warn); border-color: color-mix(in oklab, var(--warn) 40%, transparent); }
+
+.keycard__meta {
+  display: grid;
+  gap: 5px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--dust);
+}
+.keycard__meta div { display: flex; gap: 8px; }
+.keycard__meta b { color: var(--dust-dim); font-weight: 400; min-width: 52px; }
+.keycard__meta span { overflow-wrap: anywhere; }
+
+/* Probe output hugs its content; the flexible gap sits above the button row. */
+.keycard__spring { flex: 1 1 auto; min-height: 0; }
+
+.probe {
+  flex: 0 0 auto;
+  padding: 10px 11px;
+  border-radius: 11px;
+  border: 1px solid var(--edge);
+  background: var(--ink-050);
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--dust);
+  max-height: 128px;
+  overflow: auto;
+  scrollbar-width: thin;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* Sidebar readout: capped height with a bottom fade, so a long answer reads as
+   "scroll me" instead of looking like text sliced off mid-glyph. */
+#probe-last {
+  max-height: 150px;
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 22px), transparent);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 22px), transparent);
+}
+.probe__src {
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  border: 1px solid var(--edge);
+  border-radius: 6px;
+  color: var(--dust-dim);
+  letter-spacing: 0.1em;
+}
+.probe__head {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+  color: var(--dust-dim);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+.probe__head .ok { color: var(--ok); }
+.probe__head .bad { color: var(--bad); }
+
+.keycard__acts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+/* ----------------------------------------------------------------- models */
+
+.modelbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 16px;
+}
+
+.finder {
+  position: relative;
+  flex: 1;
+  min-width: 220px;
+}
+.finder .ic {
+  position: absolute;
+  left: 12px; top: 50%;
+  transform: translateY(-50%);
+  width: 15px; height: 15px;
+  color: var(--dust-dim);
+  pointer-events: none;
+}
+.finder input {
+  width: 100%;
+  padding: 11px 40px 11px 36px;
+  color: var(--pearl);
+  background: var(--ink-100);
+  border: 1px solid var(--edge);
+  border-radius: 11px;
+  font-family: var(--mono);
+  font-size: 12px;
+  outline: none;
+  transition: border-color 0.3s var(--snap), box-shadow 0.4s var(--snap);
+}
+.finder input:focus {
+  border-color: var(--edge-hot);
+  box-shadow: 0 0 0 4px color-mix(in oklab, var(--spec-cyan) 9%, transparent);
+}
+
+.finder__clear {
+  position: absolute;
+  right: 7px; top: 50%;
+  transform: translateY(-50%);
+  display: none;
+  place-items: center;
+  padding: 5px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--ink-300);
+  color: var(--dust);
+  cursor: pointer;
+  transition: color 0.25s var(--snap), background 0.25s var(--snap);
+}
+.finder__clear .ic { width: 13px; height: 13px; }
+.finder__clear:hover { color: var(--pearl); background: var(--ink-400); }
+.finder.has-text .finder__clear { display: grid; }
+
+/* The counter is the filter's only feedback — keep it legible. */
+#m-count { color: var(--pearl); border-color: color-mix(in oklab, var(--pearl) 20%, transparent); }
+#m-current { max-width: 320px; overflow: hidden; }
+#m-current span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.models {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(268px, 1fr));
+  gap: 10px;
+}
+
+.model {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 13px;
+  text-align: left;
+  border: 1px solid var(--edge);
+  border-radius: 13px;
+  background: color-mix(in oklab, var(--ink-100) 72%, transparent);
+  color: var(--pearl);
+  cursor: pointer;
+  transition: transform 0.55s var(--spring), border-color 0.3s var(--snap),
+              background 0.3s var(--snap);
+  animation: rise 0.5s var(--spring) both;
+}
+.model:hover {
+  transform: translateY(-3px) scale(1.012);
+  border-color: var(--edge-hot);
+  background: var(--ink-200);
+}
+.model.is-on {
+  border-color: color-mix(in oklab, var(--spec-cyan) 55%, transparent);
+  background: linear-gradient(140deg, color-mix(in oklab, var(--spec-cyan) 13%, transparent), transparent 60%);
+}
+.model__id {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+  line-height: 1.4;
+}
+.model__row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.empty {
+  padding: 44px 20px;
+  text-align: center;
+  border: 1px dashed var(--ink-400);
+  border-radius: 15px;
+  color: var(--dust-dim);
+  font-family: var(--mono);
+  font-size: 12px;
+  letter-spacing: 0.08em;
+}
+.empty .ic { width: 26px; height: 26px; margin-bottom: 10px; opacity: 0.55; }
+
+/* ------------------------------------------------------------------ toasts */
+
+.toasts {
+  position: fixed;
+  right: 18px; bottom: 18px;
+  z-index: 90;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  max-width: 380px;
+}
+
+.toast {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 11px 13px;
+  border: 1px solid var(--edge);
+  border-left-width: 3px;
+  border-radius: 12px;
+  background: color-mix(in oklab, var(--ink-200) 94%, transparent);
+  backdrop-filter: blur(12px);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--pearl);
+  box-shadow: 0 22px 46px -26px #000;
+  animation: toastIn 0.55s var(--spring) both;
+  overflow-wrap: anywhere;
+}
+.toast.is-out { animation: toastOut 0.34s var(--snap) both; }
+.toast--ok { border-left-color: var(--ok); }
+.toast--bad { border-left-color: var(--bad); }
+.toast--info { border-left-color: var(--spec-cyan); }
+.toast .ic { width: 15px; height: 15px; flex: 0 0 auto; margin-top: 1px; }
+.toast--ok .ic { color: var(--ok); }
+.toast--bad .ic { color: var(--bad); }
+.toast--info .ic { color: var(--spec-cyan); }
+
+@keyframes toastIn {
+  from { opacity: 0; transform: translate3d(24px, 10px, 0) scale(0.94); }
+  to   { opacity: 1; transform: none; }
+}
+@keyframes toastOut {
+  to { opacity: 0; transform: translate3d(18px, 0, 0) scale(0.96); }
+}
+
+/* ----------------------------------------------------------------- utility */
+
+.ic { display: inline-block; vertical-align: middle; flex: 0 0 auto; }
+.spacer { margin-left: auto; }
+.mono { font-family: var(--mono); }
+.dim { color: var(--dust-dim); }
+
+/* Controls that only exist to compensate for the narrow layout. */
+.only-mobile { display: none; }
+
+/* ---------------------------------------------------------------- sheet
+   Credential editor. Fixed overlay rather than an inline expanding card so
+   editing does not reflow the list underneath it mid-edit. */
+.sheet {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+}
+.sheet[hidden] { display: none; }
+
+.sheet__veil {
+  position: absolute;
+  inset: 0;
+  background: color-mix(in oklab, var(--ink-000) 74%, transparent);
+  backdrop-filter: blur(6px);
+  animation: veil-in 0.18s ease both;
+}
+
+.sheet__body {
+  position: relative;
+  width: min(560px, 100%);
+  max-height: calc(100dvh - 40px);
+  overflow-y: auto;
+  padding: 18px;
+  border: 1px solid var(--edge);
+  border-radius: 18px;
+  background:
+    radial-gradient(120% 90% at 8% 0%, color-mix(in oklab, var(--spec-violet) 12%, transparent), transparent 60%),
+    var(--ink-100);
+  box-shadow: 0 30px 80px -20px var(--ink-000);
+  animation: sheet-in 0.22s cubic-bezier(0.2, 0.9, 0.2, 1) both;
+}
+
+.sheet__head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-bottom: 14px;
+  color: var(--pearl);
+}
+.sheet__head h3 {
+  margin: 0;
+  font-size: 15px;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+/* .ic carries no intrinsic size in this sheet — every other context sets it
+   explicitly. Without both the size and flex-shrink:0 the injected SVG expands
+   to fill the flex row, which squeezes the title into one glyph per line. */
+.sheet__head .ic {
+  flex: 0 0 auto;
+  width: 15px;
+  height: 15px;
+  color: var(--spec-cyan);
+}
+
+/* One column: a 560px sheet split into auto-fit tracks would put BASE URL and
+   API KEY side by side at ~250px each, too narrow to read either value. */
+.forge--sheet {
+  grid-template-columns: minmax(0, 1fr);
+  margin-bottom: 14px;
+}
+
+/* Sticky so the save/cancel pair stays reachable when a long form or a short
+   viewport makes the sheet body scroll. */
+.sheet__acts {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  gap: 9px;
+  padding-top: 12px;
+  background: linear-gradient(to top, var(--ink-100) 70%, transparent);
+}
+.sheet__acts .ic { flex: 0 0 auto; width: 15px; height: 15px; }
+
+@keyframes veil-in { from { opacity: 0; } }
+@keyframes sheet-in {
+  from { opacity: 0; transform: translateY(10px) scale(0.985); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sheet__veil, .sheet__body { animation: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ================================================================== mobile
+   Below 860px the two structural assumptions of the desktop layout break:
+   a permanent 78px side rail eats a tenth of a phone's width, and the 320px
+   chat sidebar cannot coexist with a readable transcript. So the rail becomes
+   a bottom tab bar (thumb reach, and it survives the browser chrome), and the
+   sidebar cards move inline above the transcript instead of being hidden —
+   the old 1180px rule dropped "一键测活" and quick-switch entirely on phones,
+   which are the controls you most want when checking a gateway from a phone.
+   ========================================================================= */
+
+@media (max-width: 860px) {
+  :root {
+    --gutter: 14px;
+    /* Height of the bottom bar, including the safe-area inset on notched
+       phones. Every scroll container pads its bottom by this much. */
+    --tabbar: calc(58px + env(safe-area-inset-bottom, 0px));
+  }
+
+  /* Let the page use the real visual viewport: 100vh on mobile Safari counts
+     the collapsed-toolbar height, so the composer ends up under the chrome. */
+  html, body { height: 100dvh; }
+
+  .shell {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) auto;
+    height: 100dvh;
+  }
+
+  /* ---- rail becomes a bottom tab bar ---- */
+  .rail {
+    grid-row: 2;
+    flex-direction: row;
+    justify-content: space-around;
+    align-items: center;
+    gap: 0;
+    padding: 6px 8px calc(6px + env(safe-area-inset-bottom, 0px));
+    border-right: 0;
+    border-top: 1px solid var(--edge);
+    background: color-mix(in oklab, var(--ink-050) 94%, transparent);
+  }
+  /* The logo and vertical wordmark are pure decoration — on a phone the tab
+     bar needs every pixel for touch targets. */
+  .mark, .rail__wordmark { display: none; }
+
+  .rail__nav {
+    flex-direction: row;
+    gap: 4px;
+    margin: 0;
+    flex: 1;
+    justify-content: space-around;
+  }
+
+  .navbtn {
+    width: auto;
+    min-width: 56px;
+    height: 46px;
+    padding: 0 14px;
+    border-radius: 12px;
+  }
+  /* The active marker is a left-edge bar on desktop; on a horizontal bar it
+     has to move to the top edge or it collides with the neighbouring tab. */
+  .navbtn.is-on::after {
+    left: 50%; top: -6px;
+    width: 22px; height: 3px;
+    transform: translateX(-50%);
+  }
+  /* Hover tooltips are meaningless on touch and would fire on tap, leaving a
+     label stuck over the layout. */
+  .navbtn__tip { display: none; }
+  .navbtn:hover { transform: none; }
+
+  .navbtn--out { margin: 0; }
+
+  .pulse { margin-left: 4px; }
+
+  /* ---- topbar ---- */
+  .topbar {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+    padding: 12px var(--gutter) 12px;
+  }
+  .title { justify-content: space-between; }
+  .title h1 { font-size: 20px; }
+  /* The subtitle repeats what the tab bar and title already say. */
+  .title span { display: none; }
+
+  /* Readouts scroll horizontally rather than wrapping into four stacked rows
+     that would push the transcript off-screen. */
+  .readouts {
+    margin-left: 0;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    scrollbar-width: none;
+    justify-content: flex-start;
+    padding-bottom: 2px;
+  }
+  .readouts::-webkit-scrollbar { display: none; }
+  .readout { min-width: 96px; flex: 0 0 auto; padding: 6px 10px; }
+  .readout dd { max-width: 132px; font-size: 12px; }
+
+  /* ---- chat ---- */
+  /* Flex column, not a one-track grid: with grid the transcript would land in
+     an `auto` row and .log's flex:1 would have no bounded height to divide, so
+     the composer gets pushed off-screen as messages arrive. Flex gives .tty a
+     definite remaining height to scroll inside. */
+  .panel--chat.is-live {
+    display: flex;
+    flex-direction: column;
+  }
+  .panel--chat .tty { flex: 1 1 auto; min-height: 0; }
+
+  /* Re-show the sidebar the desktop breakpoint hides, as a normal block that
+     scrolls with the transcript. .tty and .aside both live in one scroll
+     container so the phone gets a single vertical flow instead of two
+     nested scroll areas fighting each other. */
+  .panel--chat .aside {
+    /* Collapsed by default: the transcript is the reason you opened the tab.
+       Tapping 面板 in the chat header expands it. */
+    display: none;
+    order: -1;
+    border-left: 0;
+    border-bottom: 1px solid var(--edge);
+    padding: 12px var(--gutter);
+    overflow: visible;
+    flex: 0 0 auto;
+  }
+  .panel--chat.show-aside .aside { display: flex; }
+
+  .only-mobile { display: inline-flex; }
+  /* Mirror the rail's active treatment so it is obvious the panel is open. */
+  #btn-aside.is-on-mobile {
+    color: var(--ink-000);
+    background: linear-gradient(135deg, var(--spec-cyan), var(--spec-blue));
+    border-color: transparent;
+  }
+
+  .tty { border-right: 0; }
+
+  .tty__head {
+    padding: 9px var(--gutter);
+    font-size: 10px;
+    gap: 7px;
+  }
+  /* The session id is long and low-value on a narrow header. */
+  #tty-session {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 34vw;
+  }
+
+  .log {
+    padding: 14px var(--gutter) 18px;
+    font-size: 13px;
+    /* Stop iOS shrinking the transcript when the phone is rotated. */
+    -webkit-text-size-adjust: 100%;
+  }
+
+  .composer { padding: 10px var(--gutter) 12px; }
+
+  /* Send/stop drop below the input: at 360px a row of prompt + textarea + two
+     buttons leaves the textarea about 90px wide. */
+  .composer__row {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-areas: "prompt input" "acts acts";
+    gap: 8px 10px;
+  }
+  .prompt { grid-area: prompt; padding-bottom: 14px; }
+  textarea#msg {
+    grid-area: input;
+    /* 16px keeps iOS from zooming the viewport on focus — below that Safari
+       scales the page and the layout never fully recovers. */
+    font-size: 16px;
+    min-height: 44px;
+    max-height: 34dvh;
+  }
+  #btn-send, #btn-stop {
+    grid-area: acts;
+    min-height: 44px; /* touch target */
+  }
+  .composer__row #btn-send { justify-self: stretch; }
+  /* Put the two action buttons side by side within the shared grid area. */
+  .composer__row {
+    grid-template-areas: "prompt input" "send stop";
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+  #btn-send { grid-area: send; padding-inline: 22px; }
+  #btn-stop { grid-area: stop; }
+
+  .composer__meta {
+    gap: 8px;
+    font-size: 9.5px;
+    letter-spacing: 0.1em;
+    flex-wrap: wrap;
+  }
+
+  /* ---- keys / models ---- */
+  /* The tab bar is its own grid row rather than an overlay, so only fixed
+     elements need to dodge it — the scroll containers do not. */
+  .wide { padding: 14px var(--gutter) 24px; }
+
+  .sect { flex-wrap: wrap; gap: 6px 10px; }
+  .sect h2 { font-size: 17px; }
+  .sect p { font-size: 10px; }
+  .sect .spacer { margin-left: auto; }
+
+  /* One column: the 168px auto-fit tracks produced cramped two-column forms
+     on a 390px screen. */
+  .forge {
+    grid-template-columns: minmax(0, 1fr);
+    padding: 13px;
+    gap: 10px;
+  }
+  .keys { grid-template-columns: minmax(0, 1fr); gap: 11px; }
+  .models { grid-template-columns: minmax(0, 1fr); }
+
+  /* Hover lifts read as jitter on touch (they latch after a tap). */
+  .keycard:hover, .model:hover, .card:hover, .btn:hover {
+    transform: none;
+  }
+
+  .keycard__acts .btn { min-height: 40px; }
+
+  .modelbar { gap: 8px; }
+  .finder { min-width: 100%; }
+  .finder input { font-size: 16px; } /* no iOS focus zoom */
+  #m-current { max-width: 100%; }
+
+  /* ---- toasts ---- */
+  /* Bottom-right would sit behind the tab bar. */
+  .toasts {
+    right: 10px; left: 10px;
+    bottom: calc(10px + var(--tabbar));
+    max-width: none;
+  }
+
+  /* ---- ambience ---- */
+  /* The canvas field and two drifting blooms are the heaviest thing on the
+     page; on a phone they cost battery and can drop the scroll below 60fps
+     for decoration that is mostly hidden behind content anyway. */
+  #field { display: none; }
+  .bloom { opacity: 0.5; }
+}
+
+/* Very narrow phones (≤380px): shed the last of the horizontal padding. */
+@media (max-width: 380px) {
+  :root { --gutter: 11px; }
+  .readout { min-width: 88px; }
+  .navbtn { min-width: 48px; padding: 0 10px; }
+  .title h1 { font-size: 18px; }
+}
+
+/* Landscape phones: height is the scarce axis, so trim vertical chrome. */
+@media (max-width: 900px) and (max-height: 480px) {
+  .topbar { padding-block: 8px; }
+  .title h1 { font-size: 17px; }
+  .readouts { display: none; } /* the status bar under the composer covers it */
+  .log { padding-block: 10px; }
+}
