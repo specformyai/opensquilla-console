@@ -41,6 +41,7 @@ import os
 import re
 import shutil
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -51,10 +52,17 @@ from typing import Any
 
 GITHUB_REPO = os.environ.get("SQUILLA_OS_REPO", "opensquilla/opensquilla")
 GITHUB_API = f"https://api.github.com/repos/{GITHUB_REPO}"
-# Official passive-update manifest (see opensquilla/observability/update_check.py).
+# The vendor's own China-facing mirror root (see
+# opensquilla/observability/update_check.py: DEFAULT_UPDATE_CHANNEL_ROOT).
+OSS_ROOT = os.environ.get(
+    "SQUILLA_OS_OSS_ROOT",
+    "https://opensquilla-releases.oss-cn-beijing.aliyuncs.com",
+)
+# Official passive-update manifest. Kept as an explicit override because a
+# self-hosted mirror is a reasonable deployment.
 OSS_CHANNEL_STABLE = os.environ.get(
     "SQUILLA_OS_CHANNEL",
-    "https://opensquilla-releases.oss-cn-beijing.aliyuncs.com/releases/channels/stable.json",
+    f"{OSS_ROOT}/releases/channels/stable.json",
 )
 
 # Only versions matching this may be turned into a download URL.
@@ -65,8 +73,175 @@ def wheel_name(version: str) -> str:
     return f"opensquilla-{version}-py3-none-any.whl"
 
 
-def wheel_url(version: str) -> str:
-    return f"https://github.com/{GITHUB_REPO}/releases/download/v{version}/{wheel_name(version)}"
+# --------------------------------------------------------------------------
+# Download source: measured, not assumed
+# --------------------------------------------------------------------------
+# The same wheel is published to GitHub Releases and to the vendor's Aliyun OSS
+# bucket (verified: both answer a ranged GET with an identical 66,633,623 byte
+# Content-Range). Which one is closer is a property of where this host sits, so
+# hardcoding either is wrong. Measured from the Los Angeles host this console
+# runs on, GitHub's API answered in 61ms against Aliyun's 659ms and the wheel
+# in 496ms against 860ms; inside mainland China the ordering inverts. So the
+# source is probed and the winner cached.
+#
+# `SQUILLA_OS_SOURCE` pins it: "github", "aliyun", or "auto" (default).
+
+SOURCE_SPECS: dict[str, dict[str, str]] = {
+    "github": {
+        "label": "GitHub Releases",
+        "wheel": "https://github.com/{repo}/releases/download/v{version}/{wheel}",
+        # Cheapest representative request that exercises the same host+TLS path.
+        "probe": f"{GITHUB_API}/releases?per_page=1",
+    },
+    "aliyun": {
+        "label": "阿里云 OSS 镜像",
+        "wheel": f"{OSS_ROOT}/releases/v{{version}}/{{wheel}}",
+        "probe": OSS_CHANNEL_STABLE,
+    },
+}
+SOURCE_PIN = (os.environ.get("SQUILLA_OS_SOURCE", "auto") or "auto").strip().lower()
+# GitHub is the canonical publisher, so it is the answer before any measurement.
+SOURCE_DEFAULT = "github"
+SOURCE_TTL_SECONDS = 6 * 3600.0
+_SOURCE_STATE: dict[str, Any] = {"id": "", "at": 0.0, "probes": [], "reason": ""}
+_SOURCE_LOCK: asyncio.Lock | None = None
+
+
+def _source_cache_path() -> Path:
+    root = os.environ.get("SQUILLA_CONSOLE_DATA", "") or str(Path(__file__).parent / "data")
+    return Path(root) / "update_source.json"
+
+
+def _load_source_state() -> None:
+    """Survive a restart without re-probing; the answer changes only if the host moves."""
+    if _SOURCE_STATE["id"]:
+        return
+    with contextlib.suppress(Exception):
+        raw = json.loads(_source_cache_path().read_text("utf-8"))
+        if isinstance(raw, dict) and raw.get("id") in SOURCE_SPECS:
+            _SOURCE_STATE.update({
+                "id": raw["id"],
+                "at": float(raw.get("at") or 0),
+                "probes": raw.get("probes") or [],
+                "reason": str(raw.get("reason") or ""),
+            })
+
+
+def _save_source_state() -> None:
+    with contextlib.suppress(Exception):
+        path = _source_cache_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(_SOURCE_STATE, ensure_ascii=False, indent=2), "utf-8")
+        # This file holds no secret, but it lives in the credential directory and
+        # every other file there is 0600; a stray world-readable file in a 0700
+        # dir is the kind of inconsistency that later gets copied onto one that
+        # does matter.
+        os.chmod(tmp, 0o600)
+        tmp.replace(path)
+        os.chmod(path, 0o600)
+
+
+def _probe_one(url: str, timeout: float) -> dict[str, Any]:
+    """Time a single byte-ranged GET. Range keeps a 65 MB wheel from being fetched."""
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "squilla-console",
+        "Range": "bytes=0-0",
+    })
+    started = time.monotonic()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - fixed hosts
+            resp.read(1)
+            code = resp.status
+    except urllib.error.HTTPError as exc:
+        # 200/206/416 all prove the host is reachable and serving.
+        code = exc.code
+    except Exception as exc:  # noqa: BLE001 - unreachable is a valid measurement
+        return {"ms": -1, "http": 0, "error": f"{type(exc).__name__}"}
+    return {"ms": int((time.monotonic() - started) * 1000), "http": code, "error": ""}
+
+
+async def probe_sources(timeout: float = 12.0) -> list[dict[str, Any]]:
+    """Measure every candidate source concurrently."""
+    async def one(sid: str) -> dict[str, Any]:
+        spec = SOURCE_SPECS[sid]
+        res = await asyncio.to_thread(_probe_one, spec["probe"], timeout)
+        return {"id": sid, "label": spec["label"], **res}
+
+    return list(await asyncio.gather(*(one(sid) for sid in SOURCE_SPECS)))
+
+
+async def resolve_source(*, force: bool = False) -> dict[str, Any]:
+    """Pick the download source for this host, caching the measurement."""
+    global _SOURCE_LOCK
+    if SOURCE_PIN in SOURCE_SPECS:
+        return {
+            "id": SOURCE_PIN,
+            "label": SOURCE_SPECS[SOURCE_PIN]["label"],
+            "reason": "由 SQUILLA_OS_SOURCE 指定",
+            "pinned": True,
+            "probes": [],
+            "age": 0.0,
+        }
+    _load_source_state()
+    fresh = _SOURCE_STATE["id"] and (time.time() - _SOURCE_STATE["at"]) < SOURCE_TTL_SECONDS
+    if fresh and not force:
+        return {
+            "id": _SOURCE_STATE["id"],
+            "label": SOURCE_SPECS[_SOURCE_STATE["id"]]["label"],
+            "reason": _SOURCE_STATE["reason"],
+            "pinned": False,
+            "probes": _SOURCE_STATE["probes"],
+            "age": time.time() - _SOURCE_STATE["at"],
+        }
+
+    if _SOURCE_LOCK is None:
+        _SOURCE_LOCK = asyncio.Lock()
+    async with _SOURCE_LOCK:
+        # Another waiter may have finished the probe while this one queued.
+        if not force and _SOURCE_STATE["id"] and (time.time() - _SOURCE_STATE["at"]) < SOURCE_TTL_SECONDS:
+            return await resolve_source()
+        probes = await probe_sources()
+        ok = sorted((p for p in probes if p["ms"] >= 0), key=lambda p: p["ms"])
+        if ok:
+            best = ok[0]
+            others = [p for p in ok[1:]]
+            if others:
+                gain = others[0]["ms"] - best["ms"]
+                reason = (f"实测最快：{best['label']} {best['ms']}ms，"
+                          f"比 {others[0]['label']} {others[0]['ms']}ms 快 {gain}ms")
+            else:
+                reason = f"只有 {best['label']} 可达（{best['ms']}ms）"
+            chosen = best["id"]
+        else:
+            chosen = SOURCE_DEFAULT
+            reason = "所有源都探测失败，回落到规范发布源"
+        _SOURCE_STATE.update({"id": chosen, "at": time.time(), "probes": probes, "reason": reason})
+        _save_source_state()
+    return {
+        "id": chosen,
+        "label": SOURCE_SPECS[chosen]["label"],
+        "reason": reason,
+        "pinned": False,
+        "probes": probes,
+        "age": 0.0,
+    }
+
+
+def current_source_id() -> str:
+    """The source decided so far, without triggering a probe."""
+    if SOURCE_PIN in SOURCE_SPECS:
+        return SOURCE_PIN
+    _load_source_state()
+    return _SOURCE_STATE["id"] or SOURCE_DEFAULT
+
+
+def wheel_url(version: str, source: str | None = None) -> str:
+    sid = source or current_source_id()
+    spec = SOURCE_SPECS.get(sid) or SOURCE_SPECS[SOURCE_DEFAULT]
+    return spec["wheel"].format(
+        repo=GITHUB_REPO, version=version, wheel=wheel_name(version),
+    )
 
 
 # --------------------------------------------------------------------------
@@ -151,13 +326,14 @@ def installed_extras() -> list[str]:
     return [OS_EXTRAS_FALLBACK] if OS_EXTRAS_FALLBACK else []
 
 
-def requirement(version: str, extras: list[str] | None = None) -> str:
+def requirement(version: str, extras: list[str] | None = None,
+                source: str | None = None) -> str:
     """Build the pinned `pkg[extras] @ url` requirement uv will install."""
     if not VERSION_RE.match(version):
         raise ValueError(f"版本号不合法: {version!r}")
     names = extras if extras is not None else installed_extras()
     suffix = f"[{','.join(names)}]" if names else ""
-    return f"opensquilla{suffix} @ {wheel_url(version)}"
+    return f"opensquilla{suffix} @ {wheel_url(version, source)}"
 
 
 # --------------------------------------------------------------------------
@@ -287,10 +463,16 @@ async def check_update() -> dict[str, Any]:
         "releases_error": "",
         "installable": [],
         "latest_wheel_size": 0,
+        "source": {},
     }
     cur = await current_version()
     out["current"] = cur["version"]
     out["gateway_running"] = cur["gateway_running"]
+
+    # Which mirror this host should download from is measured, not assumed; the
+    # answer is cached, so this is normally free.
+    with contextlib.suppress(Exception):
+        out["source"] = await resolve_source()
 
     official = await run_capture([OS_BIN, "version", "--check", "--json"], timeout=90)
     if official["rc"] == 0:
@@ -398,7 +580,21 @@ async def preflight(version: str) -> dict[str, Any]:
         detail = f"无法访问 GitHub Releases: {type(exc).__name__}"
     checks.append({"name": "目标 wheel 存在", "ok": reachable, "detail": detail[:160]})
 
-    return {"ok": all(c["ok"] for c in checks), "checks": checks}
+    # The release list only proves GitHub published the asset. When the chosen
+    # source is a mirror, the mirror's own copy is what uv will actually fetch,
+    # and mirrors lag: a version present upstream can still 404 here.
+    src = await resolve_source()
+    url = wheel_url(version, src["id"])
+    probe = await asyncio.to_thread(_probe_one, url, 15.0)
+    src_ok = probe["http"] in {200, 206, 416}
+    checks.append({
+        "name": f"下载源可达（{src['label']}）",
+        "ok": src_ok,
+        "detail": (f"HTTP {probe['http']} · {probe['ms']}ms" if src_ok
+                   else f"HTTP {probe['http']} {probe['error']} — 该源没有这个版本"),
+    })
+
+    return {"ok": all(c["ok"] for c in checks), "checks": checks, "source": src}
 
 
 # --------------------------------------------------------------------------
@@ -517,6 +713,101 @@ async def _stream(job: Job, args: list[str], timeout: float = 1800.0) -> int:
     return rc
 
 
+# --------------------------------------------------------------------------
+# Snapshot cache
+# --------------------------------------------------------------------------
+# Assembling the panel's data costs three subprocess round-trips through the
+# opensquilla CLI (measured on the production host: --version 4.4s,
+# version --check 5.3s, gateway status 4.8s) plus a GitHub API call. Serialised
+# behind a click that is ~15s of dead UI, which is why the panel originally
+# waited for a button press. Cache it instead and refresh in the background, so
+# opening the panel paints from memory and the operator never presses anything.
+
+SNAPSHOT_TTL_SECONDS = 120.0
+SNAPSHOT_REFRESH_SECONDS = 90.0
+_SNAP: dict[str, Any] = {"data": None, "at": 0.0}
+_SNAP_LOCK: asyncio.Lock | None = None
+_SNAP_TASK: asyncio.Task | None = None
+
+
+async def _build_snapshot() -> dict[str, Any]:
+    info = await current_version()
+    update = await check_update()
+    return {
+        "current": info,
+        "update": update,
+        "layout": layout(),
+        "extras": installed_extras(),
+    }
+
+
+async def snapshot(*, force: bool = False) -> dict[str, Any]:
+    """Panel data, served from cache unless it is stale or `force` is set."""
+    global _SNAP_LOCK
+    age = time.time() - float(_SNAP["at"] or 0)
+    if _SNAP["data"] is not None and not force and age < SNAPSHOT_TTL_SECONDS:
+        return dict(_SNAP["data"]) | {"cached": True, "age": age}
+
+    if _SNAP_LOCK is None:
+        _SNAP_LOCK = asyncio.Lock()
+    if _SNAP_LOCK.locked() and _SNAP["data"] is not None and not force:
+        # A refresh is already running: serve the stale copy rather than queue
+        # behind ~15s of subprocess work.
+        return dict(_SNAP["data"]) | {"cached": True, "age": age, "refreshing": True}
+
+    async with _SNAP_LOCK:
+        age = time.time() - float(_SNAP["at"] or 0)
+        if _SNAP["data"] is not None and not force and age < SNAPSHOT_TTL_SECONDS:
+            return dict(_SNAP["data"]) | {"cached": True, "age": age}
+        data = await _build_snapshot()
+        _SNAP["data"] = data
+        _SNAP["at"] = time.time()
+    return dict(data) | {"cached": False, "age": 0.0}
+
+
+def snapshot_now() -> dict[str, Any] | None:
+    """Whatever is cached, without triggering any work. None before the first build."""
+    if _SNAP["data"] is None:
+        return None
+    return dict(_SNAP["data"]) | {
+        "cached": True,
+        "age": time.time() - float(_SNAP["at"] or 0),
+    }
+
+
+async def _snapshot_loop() -> None:
+    # First build happens immediately so the panel has data before anyone opens
+    # it; a failure here must never take the console down.
+    while True:
+        with contextlib.suppress(Exception):
+            await snapshot(force=True)
+        try:
+            await asyncio.sleep(SNAPSHOT_REFRESH_SECONDS)
+        except asyncio.CancelledError:
+            return
+
+
+def start_snapshot_refresh() -> None:
+    global _SNAP_TASK
+    if _SNAP_TASK is None or _SNAP_TASK.done():
+        _SNAP_TASK = asyncio.create_task(_snapshot_loop())
+
+
+async def stop_snapshot_refresh() -> None:
+    global _SNAP_TASK
+    task, _SNAP_TASK = _SNAP_TASK, None
+    if task is None:
+        return
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+def invalidate_snapshot() -> None:
+    """Force the next read to rebuild — call after anything that changes state."""
+    _SNAP["at"] = 0.0
+
+
 async def install_version(
     version: str,
     *,
@@ -525,20 +816,39 @@ async def install_version(
     healthz_url: str = "",
 ) -> Job:
     """Install/upgrade to `version`, cycling the gateway around the swap."""
-    req = requirement(version, extras)  # validates the version first
+    requirement(version, extras)  # validates the version before any work starts
 
     async def work(job: Job) -> dict[str, Any]:
         before = await current_version()
         job.log(f"当前版本: {before['version'] or '未知'}"
                 f" | 网关: {'运行中' if before['gateway_running'] else '未运行'}")
         job.log(f"目标: {version}")
-        job.log(f"需求串: {req}")
 
         pre = await preflight(version)
         for check in pre["checks"]:
             job.log(f"[{'OK ' if check['ok'] else 'BAD'}] {check['name']}: {check['detail']}")
-        if not pre["ok"]:
+
+        # Source selection is measured per host, so say which one was picked and
+        # why — otherwise a slow download looks like a hung install.
+        src = pre.get("source") or await resolve_source()
+        source_id = src["id"]
+        job.log(f"下载源: {src['label']}（{src.get('reason') or '默认'}）")
+
+        # A mirror can lag behind the canonical publisher. Rather than failing,
+        # fall back to GitHub, which is where releases actually land first.
+        src_check = next((c for c in pre["checks"] if c["name"].startswith("下载源")), None)
+        if src_check and not src_check["ok"] and source_id != SOURCE_DEFAULT:
+            job.log(f"该源没有 {version}，回落到 {SOURCE_SPECS[SOURCE_DEFAULT]['label']}")
+            source_id = SOURCE_DEFAULT
+            probe = await asyncio.to_thread(_probe_one, wheel_url(version, source_id), 15.0)
+            if probe["http"] not in {200, 206, 416}:
+                raise RuntimeError(f"两个下载源都拿不到 {version} 的 wheel，已终止")
+            job.log(f"[OK ] 回落源可达: HTTP {probe['http']} · {probe['ms']}ms")
+        elif not pre["ok"]:
             raise RuntimeError("预检未通过，已终止（未改动任何文件）")
+
+        req = requirement(version, extras, source_id)
+        job.log(f"需求串: {req}")
 
         was_running = before["gateway_running"]
         if was_running and restart_gateway:

@@ -89,7 +89,9 @@ tests/test_backend.py  端到端后端测试：全新安装 → 强制改密 →
 
 **升级只走 GitHub Releases 的 wheel，不走 PyPI。** PyPI 上的 `opensquilla` 落后实际发布多个小版本，把"最新版"解析成 PyPI 最新会导致降级。代码里有一条硬闸门确保候选版本必须真的比已装版本新，且 wheel 资产必须已发布。
 
-**版本查询用两个独立信源。** `opensquilla version --check --json` 读官方渠道清单（阿里云 OSS 镜像，国内可达、无 API 限流），GitHub Releases API 提供权威的资产列表。清单跑在资产发布之前时，以资产列表为准，避免装到一个 404。
+**版本查询用两个独立信源。** `opensquilla version --check --json` 读官方渠道清单，GitHub Releases API 提供权威的资产列表。清单跑在资产发布之前时，以资产列表为准，避免装到一个 404。注意官方清单只描述桌面端安装包（`darwin-arm64` / `win32-x64`），拿不到 wheel 地址，所以它只当版本信号用。
+
+**下载源是实测出来的，不是假设出来的。** 同一个 wheel 同时发布在 GitHub Releases 和厂商的阿里云 OSS 镜像上（两边 ranged GET 返回的 `Content-Range` 字节数完全一致）。哪个更快取决于这台主机在哪，写死任何一个都是错的：本项目的部署主机在洛杉矶，实测 GitHub 381ms、阿里云 1104ms；机器放在中国大陆时结论会反过来。所以启动时并发探一次两个源、缓存 6 小时，并把测得的数字显示在面板上，让运维一眼看出这是实测结论而不是硬编码默认值。`SQUILLA_OS_SOURCE=github|aliyun` 可以固定它。镜像同步滞后时（上游已发布、镜像还没有）安装会自动回落到 GitHub，而不是直接失败。
 
 **wheel URL 永不接受客户端输入。** 浏览器只能提交版本号，服务端校验后自己拼出规范 URL。接受 URL 会把运维面板变成任意代码安装器。
 

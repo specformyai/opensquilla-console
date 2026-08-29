@@ -1176,17 +1176,22 @@ class InstallPayload(BaseModel):
 
 
 @app.get("/api/opensquilla")
-async def api_opensquilla() -> JSONResponse:
-    """Installed version, layout, and whether a newer release exists."""
-    info = await installer.current_version()
-    update = await installer.check_update()
-    return JSONResponse({
-        "current": info,
-        "update": update,
-        "layout": installer.layout(),
-        "extras": installer.installed_extras(),
-        "job": runner_snapshot(),
-    })
+async def api_opensquilla(refresh: bool = False) -> JSONResponse:
+    """Installed version, layout, and whether a newer release exists.
+
+    Served from the background-refreshed cache so the panel can load itself on
+    boot; `?refresh=1` forces the ~15s subprocess round-trip.
+    """
+    snap = await installer.snapshot(force=refresh)
+    return JSONResponse(snap | {"job": runner_snapshot()})
+
+
+@app.post("/api/opensquilla/source")
+async def api_opensquilla_source() -> JSONResponse:
+    """Re-measure which download source is fastest from this host."""
+    src = await installer.resolve_source(force=True)
+    installer.invalidate_snapshot()
+    return JSONResponse({"ok": True, "source": src})
 
 
 @app.get("/api/opensquilla/releases")
@@ -1234,6 +1239,8 @@ async def api_opensquilla_gateway(action: str) -> JSONResponse:
         result = await installer.gateway_action(action)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    # The cached snapshot carries gateway state, which this call just changed.
+    installer.invalidate_snapshot()
     # The console's own link needs to notice the gateway went away and come
     # back; a reconnect nudge saves the operator a manual refresh.
     if action in {"start", "restart", "reload"}:
@@ -1275,10 +1282,15 @@ async def _startup() -> None:
     # a callback so each round reads the credential book and link state as they
     # are then, not as they were at boot.
     catalog.start(_catalog_context_async)
+    # Same idea for the version/gateway snapshot: building it costs three CLI
+    # round-trips, so it is kept warm in the background and the panel reads it
+    # from memory instead of making the operator click "refresh".
+    installer.start_snapshot_refresh()
 
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
+    await installer.stop_snapshot_refresh()
     await catalog.stop()
     await link.stop()
 

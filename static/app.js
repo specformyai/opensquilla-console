@@ -117,9 +117,11 @@ document.querySelectorAll(".navbtn").forEach((btn) => {
       }
     });
     if (tab === "models" && state.models.length === 0) loadModelsFromGateway();
-    // The version/update read shells out and hits GitHub, so it is deferred
-    // until the panel is actually opened rather than run at boot.
-    if (tab === "system" && !state.sys.current?.version) loadSystem();
+    // The snapshot is served from a background-refreshed cache, so opening the
+    // panel repaints from memory rather than waiting on the CLI. Boot already
+    // filled it in; this keeps a long-open tab from showing a stale gateway
+    // state after something changed elsewhere.
+    if (tab === "system") loadSystem({ quiet: true });
   });
 });
 
@@ -746,21 +748,34 @@ async function switchModel(model) {
    mean the newest *release wheel*, never the newest PyPI version. The server
    enforces this; the picker below only ever offers versions that ship a wheel. */
 
-async function loadSystem(event) {
-  const btn = event?.currentTarget;
+/* Called two ways: bound directly as a click handler (the argument is the
+   event), and programmatically with options. Detect which by looking for
+   currentTarget — checking arity or truthiness would treat `{force:true}` as an
+   event and silently drop the flag. */
+async function loadSystem(arg) {
+  const isEvent = !!arg && typeof arg === "object" && "currentTarget" in arg;
+  const btn = isEvent ? arg.currentTarget : null;
+  const force = !isEvent && !!(arg && arg.force);
+  const quiet = !isEvent && !!(arg && arg.quiet);
   try {
     busy(btn, true);
-    const data = await api("/api/opensquilla");
+    // The server keeps this snapshot warm in the background; ?refresh=1 pays
+    // the ~15s of CLI round-trips to rebuild it on demand.
+    const data = await api(`/api/opensquilla${force ? "?refresh=1" : ""}`);
     state.sys.current = data.current || {};
     state.sys.update = data.update || {};
     state.sys.layout = data.layout || {};
     state.sys.extras = data.extras || [];
     state.sys.releases = (data.update || {}).installable || [];
+    state.sys.cached = !!data.cached;
+    state.sys.age = Number(data.age) || 0;
     renderSystem();
     // A job may already be running from a previous page load.
     if (data.job) adoptJob(data.job, { resetCursor: true });
   } catch (err) {
-    toast(err.message, "bad");
+    // The boot-time load is best-effort: a failure there must not put an error
+    // toast in front of someone who never asked for this panel.
+    if (!quiet) toast(err.message, "bad");
   } finally {
     busy(btn, false);
   }
@@ -804,6 +819,7 @@ function renderSystem() {
   }
 
   renderReleaseOptions();
+  renderSource();
   el("sys-gw").innerHTML = `
     <div class="kv__row"><b>状态</b><span title="${escapeHtml(cur.gateway_status || "—")}">${escapeHtml(cur.gateway_status || "—")}</span></div>
     <div class="kv__row"><b>控制台链路</b><span>${state.gateway.connected ? "已连接" : "未连接"}</span></div>`;
@@ -833,7 +849,17 @@ function renderReleaseOptions() {
 }
 
 el("sys-prerelease").addEventListener("change", renderReleaseOptions);
-el("btn-sys-refresh").addEventListener("click", loadSystem);
+/* The button means "go ask the host again", so it bypasses the cache. Plain
+   panel opens read the cache; only this pays the CLI round-trips. */
+el("btn-sys-refresh").addEventListener("click", async (event) => {
+  const btn = event.currentTarget;
+  try {
+    busy(btn, true);
+    await loadSystem({ force: true });
+  } finally {
+    busy(btn, false);
+  }
+});
 
 el("btn-sys-install").addEventListener("click", async (event) => {
   const version = el("sys-target").value;
@@ -1725,6 +1751,271 @@ function startField() {
   })();
 }
 
+
+/* ------------------------------------------------------------ custom select */
+
+/* A native <select> renders its open list through the operating system: white
+   panel, system font, square corners, its own scrollbar. None of that is
+   styleable, so on this near-black UI the list reads as a different application
+   dropped on top of the console.
+
+   The native element stays in the DOM and stays the source of truth — every
+   caller reads `.value`, `#q-key` and `#q-model` listen for `change`, and the
+   <label for=...> association has to keep working. Only the presentation is
+   replaced, and selecting a row dispatches a real `change` event so existing
+   listeners fire exactly as before. */
+
+const PICKS = new WeakMap();
+
+function enhanceSelect(select) {
+  if (!select || PICKS.has(select)) return PICKS.get(select);
+
+  const wrap = document.createElement("div");
+  wrap.className = "pick";
+  select.parentNode.insertBefore(wrap, select);
+  wrap.appendChild(select);
+
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "pick__btn";
+  btn.setAttribute("aria-haspopup", "listbox");
+  btn.setAttribute("aria-expanded", "false");
+  btn.innerHTML = `<span class="pick__label"></span>${icon("chevron-down")}`;
+  wrap.appendChild(btn);
+
+  /* The menu lives on <body>, not inside .pick: `position: fixed` resolves
+     against the nearest ancestor with a transform, and .panel runs a transform
+     animation on every tab switch. Parented here it would be clipped by
+     .wide's overflow and mispositioned mid-animation. */
+  const menu = document.createElement("div");
+  menu.className = "pick__menu";
+  menu.setAttribute("role", "listbox");
+  menu.hidden = true;
+  document.body.appendChild(menu);
+
+  const ctl = { select, wrap, btn, menu, cursor: -1 };
+  PICKS.set(select, ctl);
+
+  const rows = () => Array.from(menu.querySelectorAll(".pick__opt"));
+
+  function syncLabel() {
+    const opt = select.options[select.selectedIndex];
+    const label = wrap.querySelector(".pick__label");
+    const text = opt ? opt.textContent.trim() : "";
+    label.textContent = text || "—";
+    label.classList.toggle("is-empty", !text);
+    btn.title = text;
+    btn.disabled = select.disabled;
+  }
+
+  function syncMenu() {
+    const opts = Array.from(select.options);
+    if (!opts.length) {
+      menu.innerHTML = `<div class="pick__empty">没有可选项</div>`;
+    } else {
+      menu.innerHTML = opts.map((opt, i) => {
+        const on = i === select.selectedIndex;
+        return `<button type="button" class="pick__opt${on ? " is-on" : ""}"
+          role="option" aria-selected="${on}" data-i="${i}"
+          ${opt.disabled ? "disabled" : ""}>
+          ${icon("check", "pick__tick")}
+          <span class="pick__opt-text">${escapeHtml(opt.textContent.trim())}</span>
+        </button>`;
+      }).join("");
+    }
+    syncLabel();
+  }
+
+  function place() {
+    const r = btn.getBoundingClientRect();
+    menu.style.minWidth = `${Math.round(r.width)}px`;
+    menu.style.left = `${Math.round(r.left)}px`;
+    menu.style.top = `${Math.round(r.bottom + 6)}px`;
+    // Measure only once visible, then flip above the trigger if the list would
+    // run past the bottom of the viewport.
+    const h = menu.offsetHeight;
+    if (r.bottom + 6 + h > window.innerHeight - 8) {
+      menu.style.top = `${Math.round(Math.max(8, r.top - 6 - h))}px`;
+    }
+    const overflowRight = r.left + menu.offsetWidth - (window.innerWidth - 8);
+    if (overflowRight > 0) {
+      menu.style.left = `${Math.round(Math.max(8, r.left - overflowRight))}px`;
+    }
+  }
+
+  function open() {
+    if (select.disabled || !select.options.length) return;
+    closeAllPicks(ctl);
+    syncMenu();
+    menu.hidden = false;
+    wrap.classList.add("is-open");
+    btn.setAttribute("aria-expanded", "true");
+    place();
+    ctl.cursor = select.selectedIndex;
+    paintCursor();
+    rows()[ctl.cursor]?.scrollIntoView({ block: "nearest" });
+  }
+
+  function close() {
+    menu.hidden = true;
+    wrap.classList.remove("is-open");
+    btn.setAttribute("aria-expanded", "false");
+    ctl.cursor = -1;
+  }
+
+  function paintCursor() {
+    rows().forEach((row, i) => row.classList.toggle("is-cursor", i === ctl.cursor));
+  }
+
+  function pick(index) {
+    const opt = select.options[index];
+    if (!opt || opt.disabled) return;
+    const changed = select.selectedIndex !== index;
+    select.selectedIndex = index;
+    syncLabel();
+    close();
+    btn.focus();
+    // Existing listeners (quick key/model switch) are bound to `change`, which
+    // a programmatic selection does not fire on its own.
+    if (changed) select.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+
+  function step(delta) {
+    const total = select.options.length;
+    if (!total) return;
+    let next = ctl.cursor;
+    for (let n = 0; n < total; n += 1) {
+      next = (next + delta + total) % total;
+      if (!select.options[next].disabled) break;
+    }
+    ctl.cursor = next;
+    paintCursor();
+    rows()[next]?.scrollIntoView({ block: "nearest" });
+  }
+
+  btn.addEventListener("click", () => (menu.hidden ? open() : close()));
+
+  btn.addEventListener("keydown", (event) => {
+    if (["ArrowDown", "ArrowUp", "Enter", " "].includes(event.key)) {
+      event.preventDefault();
+      if (menu.hidden) open();
+      else if (event.key === "Enter" || event.key === " ") pick(ctl.cursor);
+      else step(event.key === "ArrowDown" ? 1 : -1);
+    } else if (event.key === "Escape" && !menu.hidden) {
+      close();
+    }
+  });
+
+  menu.addEventListener("keydown", (event) => {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      step(event.key === "ArrowDown" ? 1 : -1);
+    } else if (event.key === "Enter") {
+      event.preventDefault();
+      pick(ctl.cursor);
+    } else if (event.key === "Escape") {
+      close();
+      btn.focus();
+    } else if (event.key === "Home" || event.key === "End") {
+      event.preventDefault();
+      ctl.cursor = event.key === "Home" ? -1 : select.options.length;
+      step(event.key === "Home" ? 1 : -1);
+    }
+  });
+
+  menu.addEventListener("click", (event) => {
+    const row = event.target.closest(".pick__opt");
+    if (row) pick(Number(row.dataset.i));
+  });
+
+  menu.addEventListener("mousemove", (event) => {
+    const row = event.target.closest(".pick__opt");
+    if (row) {
+      ctl.cursor = Number(row.dataset.i);
+      paintCursor();
+    }
+  });
+
+  /* Option lists are rebuilt with innerHTML by loadProviders(),
+     renderReleaseOptions() and the quick-switch renders, none of which fire an
+     event. Observing the element keeps the trigger label truthful without
+     touching those call sites. */
+  new MutationObserver(() => {
+    if (menu.hidden) syncLabel();
+    else syncMenu();
+  }).observe(select, { childList: true, subtree: true, attributes: true,
+                       attributeFilter: ["disabled"] });
+
+  select.addEventListener("change", syncLabel);
+
+  ctl.close = close;
+  ctl.sync = syncMenu;
+  syncMenu();
+  return ctl;
+}
+
+function closeAllPicks(except = null) {
+  document.querySelectorAll(".pick.is-open > select").forEach((sel) => {
+    const ctl = PICKS.get(sel);
+    if (ctl && ctl !== except) ctl.close();
+  });
+}
+
+document.addEventListener("pointerdown", (event) => {
+  if (event.target.closest(".pick__menu") || event.target.closest(".pick")) return;
+  closeAllPicks();
+});
+// A fixed-position menu does not travel with its trigger, so any scroll or
+// resize invalidates its placement.
+window.addEventListener("scroll", () => closeAllPicks(), true);
+window.addEventListener("resize", () => closeAllPicks());
+
+["q-key", "q-model", "f-provider", "e-provider", "sys-target"]
+  .forEach((id) => enhanceSelect(el(id)));
+
+/* ------------------------------------------------ download source readout */
+
+/* Which mirror is fastest is a property of where the host sits, so the server
+   measures it instead of assuming. Surfacing the measurement matters: an
+   operator who sees "GitHub 61ms vs 阿里云 659ms" can tell a deliberate choice
+   from a hardcoded default. */
+
+function renderSource() {
+  const box = el("sys-source");
+  if (!box) return;
+  const src = (state.sys.update || {}).source || {};
+  if (!src.id) {
+    box.innerHTML = "";
+    return;
+  }
+  const probes = (src.probes || [])
+    .map((p) => `${escapeHtml(p.label)} ${p.ms >= 0 ? `${p.ms}ms` : "不可达"}`)
+    .join(" · ");
+  const pin = src.pinned ? "（已固定）" : "";
+  box.innerHTML = `
+    ${icon("route")}
+    <b>下载源</b>
+    <span>${escapeHtml(src.label || "—")}${pin}</span>
+    ${src.reason ? `<span>· ${escapeHtml(src.reason)}</span>` : ""}
+    ${probes ? `<span>· 实测 ${probes}</span>` : ""}
+    <button class="btn btn--ghost btn--tiny" id="btn-sys-source" type="button">
+      ${icon("activity")}重新测速
+    </button>`;
+  el("btn-sys-source").addEventListener("click", async (event) => {
+    const btn = event.currentTarget;
+    try {
+      busy(btn, true);
+      const data = await api("/api/opensquilla/source", { method: "POST" });
+      toast(`下载源: ${data.source?.label || "已更新"}`, "ok");
+      await loadSystem({ force: true });
+    } catch (err) {
+      toast(err.message, "bad");
+    } finally {
+      busy(btn, false);
+    }
+  });
+}
+
 /* ------------------------------------------------------------------ boot */
 
 /* On phones the sidebar cards (quick switch, gateway status, last probe) are
@@ -1767,6 +2058,11 @@ startField();
   connectBridge();
   refreshState();
   loadProviders();
+  /* Version and gateway state now load themselves. The server keeps the
+     snapshot warm in the background, so this is a cache read, not the ~15s of
+     CLI round-trips that originally justified hiding it behind a button.
+     Quiet: if it fails, the chat panel should not open with an error toast. */
+  loadSystem({ quiet: true });
   addTurn("system", `控制台就绪。测活固定问题：${PROBE_QUESTION}`);
   setInterval(() => { if (!state.streaming) refreshState(); }, 20000);
 })();
