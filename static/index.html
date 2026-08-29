@@ -35,6 +35,9 @@
       <button class="navbtn" data-tab="models" type="button">
         <i data-ic="layers"></i><span class="navbtn__tip">模型目录</span>
       </button>
+      <button class="navbtn" data-tab="system" type="button">
+        <i data-ic="settings"></i><span class="navbtn__tip">系统 / 版本</span>
+      </button>
     </div>
 
     <button class="navbtn navbtn--out" id="btn-logout" type="button" hidden>
@@ -232,10 +235,13 @@
             <p>点击卡片即切换网关主模型</p>
             <span class="spacer"></span>
             <button class="btn btn--ghost btn--tiny" id="btn-models-gw" type="button">
-              <i data-ic="database"></i>网关列表
+              <i data-ic="database"></i>读取缓存
             </button>
-            <button class="btn btn--go btn--tiny" id="btn-models-ep" type="button">
-              <i data-ic="refresh-cw"></i>从端点拉取
+            <button class="btn btn--go btn--tiny" id="btn-models-sync" type="button">
+              <i data-ic="refresh-cw"></i>立即同步
+            </button>
+            <button class="btn btn--ghost btn--tiny" id="btn-models-ep" type="button">
+              <i data-ic="key"></i>单凭据拉取
             </button>
           </div>
 
@@ -249,14 +255,153 @@
             </div>
             <span class="chip chip--on" id="m-current"><i data-ic="check"></i><span>当前 —</span></span>
             <span class="chip" id="m-count"><i data-ic="layers"></i><span>0 个模型</span></span>
+            <span class="chip" id="m-age" hidden><i data-ic="clock"></i><span>—</span></span>
           </div>
 
           <div class="models" id="models"></div>
         </div>
       </section>
 
+      <!-- ------------------------------------------------------ system -->
+      <section class="panel panel--system enter" data-panel="system">
+        <div class="wide">
+          <div class="sect">
+            <h2>系统 / 版本</h2>
+            <p>OpenSquilla 版本管理 · 网关控制 · 控制台密码</p>
+            <span class="spacer"></span>
+            <button class="btn btn--ghost btn--tiny" id="btn-sys-refresh" type="button">
+              <i data-ic="refresh-cw"></i>刷新
+            </button>
+          </div>
+
+          <div class="sysgrid">
+            <div class="card">
+              <div class="card__head"><i data-ic="package"></i>OpenSquilla 版本</div>
+              <div class="card__body">
+                <div class="kv" id="sys-version">读取中…</div>
+                <div class="sysacts">
+                  <select id="sys-target" aria-label="选择要安装的版本"></select>
+                  <label class="tick">
+                    <input type="checkbox" id="sys-prerelease" />
+                    <span>显示预发布 (rc)</span>
+                  </label>
+                  <label class="tick">
+                    <input type="checkbox" id="sys-restart" checked />
+                    <span>安装后重启网关</span>
+                  </label>
+                  <button class="btn btn--go" id="btn-sys-install" type="button">
+                    <i data-ic="download"></i>安装选定版本
+                  </button>
+                </div>
+                <p class="note" id="sys-note"></p>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card__head"><i data-ic="gauge"></i>网关控制</div>
+              <div class="card__body">
+                <div class="kv" id="sys-gw">—</div>
+                <div class="sysacts">
+                  <button class="btn btn--ghost btn--tiny" data-gw="status" type="button">状态</button>
+                  <button class="btn btn--ghost btn--tiny" data-gw="reload" type="button">重载配置</button>
+                  <button class="btn btn--hot btn--tiny" data-gw="restart" type="button">重启</button>
+                  <button class="btn btn--ghost btn--tiny" data-gw="start" type="button">启动</button>
+                  <button class="btn btn--ghost btn--tiny" data-gw="stop" type="button">停止</button>
+                </div>
+                <pre class="joblog" id="sys-gw-out" hidden></pre>
+              </div>
+            </div>
+
+            <div class="card card--wide">
+              <div class="card__head">
+                <i data-ic="terminal"></i>安装日志
+                <span class="spacer"></span>
+                <span class="chip" id="sys-job-state"><i data-ic="circle"></i><span>空闲</span></span>
+              </div>
+              <div class="card__body">
+                <pre class="joblog" id="sys-joblog">尚无安装任务。</pre>
+              </div>
+            </div>
+
+            <div class="card card--wide">
+              <div class="card__head"><i data-ic="key"></i>控制台密码</div>
+              <div class="card__body">
+                <div class="kv" id="sys-auth">—</div>
+                <div class="forge forge--pw">
+                  <div class="field">
+                    <label for="pw-current">当前密码</label>
+                    <input id="pw-current" type="password" autocomplete="current-password" />
+                  </div>
+                  <div class="field">
+                    <label for="pw-user">账号（可选，留空不改）</label>
+                    <input id="pw-user" autocomplete="off" placeholder="operator" />
+                  </div>
+                  <div class="field">
+                    <label for="pw-new">新密码</label>
+                    <input id="pw-new" type="password" autocomplete="new-password" />
+                  </div>
+                  <div class="field">
+                    <label for="pw-new2">确认新密码</label>
+                    <input id="pw-new2" type="password" autocomplete="new-password" />
+                  </div>
+                  <button class="btn btn--go" id="btn-pw-save" type="button">
+                    <i data-ic="check"></i>修改密码
+                  </button>
+                </div>
+                <p class="note">至少 12 位，含小写/大写/数字/符号中的三类。修改后所有已登录会话立即失效。</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
     </div>
   </main>
+</div>
+
+<!-- ------------------------------------------- forced password rotation -->
+<!-- Shown when the console still carries its bootstrap credential. The server
+     independently rejects every other endpoint until the rotation lands, so
+     this screen is the operator's path forward, not the security boundary. -->
+<div class="gate" id="pw-gate" hidden>
+  <div class="gate__body" role="dialog" aria-modal="true" aria-labelledby="gate-title">
+    <div class="gate__head">
+      <i data-ic="triangle-alert"></i>
+      <h2 id="gate-title">请先修改初始密码</h2>
+    </div>
+    <p class="gate__lead">
+      这台控制台还在用安装时的初始密码。它能读写你的 API 凭据、花你的钱，
+      所以在改掉之前其他功能都不可用。
+    </p>
+    <div class="forge forge--gate">
+      <div class="field">
+        <label for="gate-current">当前密码（初始密码）</label>
+        <input id="gate-current" type="password" autocomplete="current-password" />
+      </div>
+      <div class="field">
+        <label for="gate-user">账号（可选）</label>
+        <input id="gate-user" autocomplete="off" placeholder="operator" />
+      </div>
+      <div class="field">
+        <label for="gate-new">新密码</label>
+        <input id="gate-new" type="password" autocomplete="new-password" />
+      </div>
+      <div class="field">
+        <label for="gate-new2">确认新密码</label>
+        <input id="gate-new2" type="password" autocomplete="new-password" />
+      </div>
+    </div>
+    <p class="gate__rule">至少 12 位，需包含小写、大写、数字、符号中的至少三类，不能含常见词或账号名。</p>
+    <div class="gate__acts">
+      <button class="btn btn--go" id="gate-save" type="button">
+        <i data-ic="check"></i>设置新密码
+      </button>
+      <button class="btn btn--ghost" id="gate-logout" type="button">
+        <i data-ic="log-out"></i>退出
+      </button>
+    </div>
+    <p class="gate__err" id="gate-err" hidden></p>
+  </div>
 </div>
 
 <div class="toasts" id="toasts"></div>

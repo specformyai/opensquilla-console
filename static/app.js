@@ -20,6 +20,14 @@ const state = {
   streaming: false,
   currentTurn: null,
   providers: [],
+  // Catalogue metadata (source, age, per-key errors) kept beside the list so
+  // the UI can say *why* a catalogue is short or stale instead of just showing
+  // fewer cards than expected.
+  catalog: {},
+  // OpenSquilla version/update state and the running install job.
+  sys: { current: {}, update: {}, releases: [], job: null },
+  jobCursor: 0,
+  jobPoll: null,
 };
 
 /* ----------------------------------------------------------------- toasts */
@@ -44,6 +52,16 @@ function escapeHtml(text) {
   return String(text ?? "").replace(/[&<>"']/g, (c) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
   }[c]));
+}
+
+/** Coarse duration for "synced N ago" labels. */
+function humanAge(seconds) {
+  const s = Number(seconds);
+  if (!Number.isFinite(s) || s < 0) return "—";
+  if (s < 60) return `${Math.round(s)} 秒`;
+  if (s < 3600) return `${Math.round(s / 60)} 分钟`;
+  if (s < 86400) return `${(s / 3600).toFixed(1)} 小时`;
+  return `${(s / 86400).toFixed(1)} 天`;
 }
 
 /* -------------------------------------------------------------------- http */
@@ -99,6 +117,9 @@ document.querySelectorAll(".navbtn").forEach((btn) => {
       }
     });
     if (tab === "models" && state.models.length === 0) loadModelsFromGateway();
+    // The version/update read shells out and hits GitHub, so it is deferred
+    // until the panel is actually opened rather than run at boot.
+    if (tab === "system" && !state.sys.current?.version) loadSystem();
   });
 });
 
@@ -540,6 +561,33 @@ function showProbe(result, key) {
 
 /* ----------------------------------------------------------------- models */
 
+/* The catalogue is a server-side cache now: reads are instant and never touch
+   the network, and a sync is an explicit action. `adoptCatalog` is shared by
+   both paths so the staleness chips can't drift between them. */
+function adoptCatalog(data) {
+  state.models = data.models || [];
+  state.catalog = {
+    source: data.source || null,
+    sourcesTried: data.sources_tried || [],
+    syncedAt: data.synced_at || null,
+    ageSeconds: data.age_seconds,
+    stale: !!data.stale,
+    cooldown: !!data.cooldown,
+    lastError: data.last_error || null,
+    errors: data.errors || [],
+  };
+  state.modelSource = SOURCE_LABEL[data.source] || data.source || "—";
+  renderModels();
+  renderQuick();
+}
+
+const SOURCE_LABEL = {
+  endpoint: "端点直拉",
+  gateway: "网关目录",
+  discover: "提供方探测",
+  cache: "本地缓存",
+};
+
 async function loadModelsFromGateway(event) {
   const btn = event?.currentTarget;
   const seq = ++state.modelsSeq;
@@ -547,21 +595,37 @@ async function loadModelsFromGateway(event) {
     busy(btn, true);
     const data = await api("/api/models");
     if (seq !== state.modelsSeq) return; // a newer pull already won
-    const models = data.models || [];
+    adoptCatalog(data);
+    const n = state.models.length;
+    if (n) toast(`目录 ${n} 个模型 · 来源 ${state.modelSource}`, "ok");
+    else toast(data.last_error ? `目录为空: ${data.last_error}` : "目录为空，点「立即同步」", "bad");
+  } catch (err) {
+    if (seq === state.modelsSeq) toast(err.message, "bad");
+  } finally {
+    busy(btn, false);
+  }
+}
 
-    // The gateway only lists what its configured provider exposes. With no
-    // provider wired yet that is legitimately empty — fall back to the active
-    // credential's own /models so the catalogue is never blank for no reason.
-    if (models.length === 0 && (el("q-key").value || state.activeId)) {
-      await loadModelsFromEndpoint(null, null, seq);
-      return;
+/* Force a multi-source refresh. This is the fix for a suspended key blanking
+   the catalogue: every stored credential on an endpoint is tried, so one
+   frozen account fails alone instead of taking the whole list down. */
+async function syncModels(event) {
+  const btn = event?.currentTarget;
+  const seq = ++state.modelsSeq;
+  try {
+    busy(btn, true);
+    const data = await api("/api/models?refresh=1");
+    if (seq !== state.modelsSeq) return;
+    adoptCatalog(data);
+    const n = state.models.length;
+    if (data.ok && n) {
+      toast(`同步到 ${n} 个模型 · 来源 ${state.modelSource}`, "ok");
+    } else {
+      toast(`同步失败: ${data.last_error || "所有数据源均未返回模型"}`, "bad");
     }
-
-    state.models = models;
-    state.modelSource = "网关";
-    renderModels();
-    renderQuick();
-    toast(`网关返回 ${models.length} 个模型`, models.length ? "ok" : "bad");
+    // Per-source notes matter here: they name which key was rejected and why,
+    // which is the difference between "endpoint down" and "that account froze".
+    (data.errors || []).slice(0, 4).forEach((line) => toast(line, "warn"));
   } catch (err) {
     if (seq === state.modelsSeq) toast(err.message, "bad");
   } finally {
@@ -591,6 +655,7 @@ async function loadModelsFromEndpoint(keyId, event, inheritSeq) {
 }
 
 el("btn-models-gw").addEventListener("click", loadModelsFromGateway);
+el("btn-models-sync").addEventListener("click", syncModels);
 el("btn-models-ep").addEventListener("click", (e) => loadModelsFromEndpoint(null, e));
 
 const filterBox = el("m-filter");
@@ -611,16 +676,34 @@ function renderModels() {
     (m) => !q || m.id.toLowerCase().includes(q) || (m.provider || "").toLowerCase().includes(q)
   );
   const current = state.gateway.model || activeKey()?.model || "";
+  const cat = state.catalog || {};
   el("m-count").innerHTML =
     `${icon("layers")}<span>${rows.length} / ${state.models.length} · 来源 ${escapeHtml(state.modelSource)}</span>`;
   el("m-current").innerHTML =
     `${icon("check")}<span>当前 ${escapeHtml(current || "—")}</span>`;
 
+  // Age and staleness are shown rather than hidden: a cached catalogue is fine,
+  // silently serving a day-old one as if it were live is not.
+  const ageChip = el("m-age");
+  if (ageChip) {
+    if (cat.syncedAt) {
+      ageChip.hidden = false;
+      ageChip.className = `chip ${cat.stale ? "chip--warn" : ""}`;
+      ageChip.innerHTML = `${icon("clock")}<span>${escapeHtml(
+        `${humanAge(cat.ageSeconds)}前同步${cat.stale ? " · 已过期" : ""}`
+      )}</span>`;
+    } else {
+      ageChip.hidden = true;
+    }
+  }
+
   const box = el("models");
   if (rows.length === 0) {
     box.innerHTML = `<div class="empty">${icon("layers")}<div>${
       state.models.length === 0
-        ? "没有模型 — 点「从端点拉取」或「网关列表」"
+        ? escapeHtml(cat.lastError
+            ? `目录为空：${cat.lastError}`
+            : "没有模型 — 点「立即同步」")
         : "该过滤条件没有匹配的模型"
     }</div></div>`;
     return;
@@ -654,6 +737,309 @@ async function switchModel(model) {
     toast(err.message, "bad");
   }
 }
+
+/* ------------------------------------------------- system / version panel */
+
+/* OpenSquilla is installed as a uv tool from a GitHub Release wheel. That
+   detail leaks into the UI for one reason worth stating: PyPI's `opensquilla`
+   stops at 0.3.0 while releases are at 0.5.x, so "install the latest" has to
+   mean the newest *release wheel*, never the newest PyPI version. The server
+   enforces this; the picker below only ever offers versions that ship a wheel. */
+
+async function loadSystem(event) {
+  const btn = event?.currentTarget;
+  try {
+    busy(btn, true);
+    const data = await api("/api/opensquilla");
+    state.sys.current = data.current || {};
+    state.sys.update = data.update || {};
+    state.sys.layout = data.layout || {};
+    state.sys.extras = data.extras || [];
+    state.sys.releases = (data.update || {}).installable || [];
+    renderSystem();
+    // A job may already be running from a previous page load.
+    if (data.job) adoptJob(data.job, { resetCursor: true });
+  } catch (err) {
+    toast(err.message, "bad");
+  } finally {
+    busy(btn, false);
+  }
+}
+
+function renderSystem() {
+  const cur = state.sys.current || {};
+  const upd = state.sys.update || {};
+  const lay = state.sys.layout || {};
+
+  const rows = [
+    ["已安装版本", cur.version || "读不到"],
+    ["最新版本", upd.latest || "未知"],
+    ["网关", cur.gateway_running ? "运行中" : "未运行"],
+    ["附加组件", (state.sys.extras || []).join(", ") || "无"],
+    ["安装目录", lay.tool_dir || "—"],
+    ["发布仓库", lay.repo || "—"],
+  ];
+  if (upd.channel_error) rows.push(["更新通道", `读取失败: ${upd.channel_error}`]);
+  if (upd.releases_error) rows.push(["发布列表", `读取失败: ${upd.releases_error}`]);
+
+  // Key in <b>, value in <span> — matching the existing .kv__row contract in
+  // app.css. Swapping them renders the row with the two colours inverted.
+  el("sys-version").innerHTML = rows.map(([k, v]) => `
+    <div class="kv__row"><b>${escapeHtml(k)}</b><span title="${escapeHtml(v)}">${escapeHtml(v)}</span></div>
+  `).join("");
+
+  const note = el("sys-note");
+  if (upd.update_available) {
+    const size = upd.latest_wheel_size
+      ? ` · wheel ${(upd.latest_wheel_size / 1048576).toFixed(0)} MB`
+      : "";
+    note.className = "note note--hot";
+    note.textContent = `有新版本 ${upd.latest}（当前 ${upd.current || "?"}）${size}。安装会停网关、替换环境、再启动。`;
+  } else if (upd.latest && upd.current) {
+    note.className = "note";
+    note.textContent = `已是最新（${upd.current}）。仍可在下拉里选择任意已发布版本重装或回退。`;
+  } else {
+    note.className = "note";
+    note.textContent = "";
+  }
+
+  renderReleaseOptions();
+  el("sys-gw").innerHTML = `
+    <div class="kv__row"><b>状态</b><span title="${escapeHtml(cur.gateway_status || "—")}">${escapeHtml(cur.gateway_status || "—")}</span></div>
+    <div class="kv__row"><b>控制台链路</b><span>${state.gateway.connected ? "已连接" : "未连接"}</span></div>`;
+
+  const info = state.sys.authInfo || {};
+  el("sys-auth").innerHTML = `
+    <div class="kv__row"><b>账号</b><span>${escapeHtml(info.user || "—")}</span></div>
+    <div class="kv__row"><b>上次修改</b><span>${
+      info.updated_at ? escapeHtml(new Date(info.updated_at * 1000).toLocaleString("zh-CN")) : "—"
+    }</span></div>
+    <div class="kv__row"><b>已修改次数</b><span>${escapeHtml(String(info.rotations ?? "—"))}</span></div>`;
+}
+
+function renderReleaseOptions() {
+  const box = el("sys-target");
+  const showPre = el("sys-prerelease").checked;
+  const rows = (state.sys.releases || []).filter((r) => showPre || !r.prerelease);
+  const keep = box.value;
+  box.innerHTML = rows.map((r) => {
+    const mark = r.version === (state.sys.current || {}).version ? " · 当前" : "";
+    const pre = r.prerelease ? " · 预发布" : "";
+    return `<option value="${escapeHtml(r.version)}">${escapeHtml(r.version)}${mark}${pre}</option>`;
+  }).join("") || `<option value="">（没有可安装版本）</option>`;
+  // Preserve the operator's pick across re-renders; otherwise default to the
+  // newest offered version.
+  if (keep && rows.some((r) => r.version === keep)) box.value = keep;
+}
+
+el("sys-prerelease").addEventListener("change", renderReleaseOptions);
+el("btn-sys-refresh").addEventListener("click", loadSystem);
+
+el("btn-sys-install").addEventListener("click", async (event) => {
+  const version = el("sys-target").value;
+  if (!version) return toast("没有选中版本", "bad");
+  const cur = (state.sys.current || {}).version || "?";
+  const restart = el("sys-restart").checked;
+  // Replacing the runtime takes the gateway down; make that explicit rather
+  // than surprising someone mid-conversation.
+  const warn = restart
+    ? "安装过程中网关会短暂停止服务。"
+    : "已选择不自动重启：安装后网关会保持停止状态，需要手动启动。";
+  if (!confirm(`将 OpenSquilla 从 ${cur} 切换到 ${version}。\n${warn}\n\n继续？`)) return;
+  // event.currentTarget is null once an await has run, so the finally block
+  // would receive null, hit busy()'s `if (!button) return`, and leave the
+  // button disabled forever — every later click then silently does nothing.
+  // The rest of this file captures the element synchronously; match that.
+  const btn = event.currentTarget;
+  try {
+    busy(btn, true);
+    const data = await api("/api/opensquilla/install", {
+      method: "POST",
+      body: JSON.stringify({ version, restart_gateway: restart }),
+    });
+    toast(`已开始安装 ${version}`, "ok");
+    adoptJob(data.job, { resetCursor: true });
+    startJobPolling();
+  } catch (err) {
+    toast(err.message, "bad");
+  } finally {
+    busy(btn, false);
+  }
+});
+
+document.querySelectorAll("[data-gw]").forEach((btn) => {
+  btn.addEventListener("click", async () => {
+    const action = btn.dataset.gw;
+    if (action === "stop" && !confirm("停止网关后对话功能不可用，确认停止？")) return;
+    try {
+      busy(btn, true);
+      const data = await api(`/api/opensquilla/gateway/${action}`, { method: "POST" });
+      const out = el("sys-gw-out");
+      out.hidden = false;
+      out.textContent = data.output || "(无输出)";
+      toast(`${action}: ${data.ok ? "成功" : "失败"}`, data.ok ? "ok" : "bad");
+      await loadSystem();
+      await refreshState();
+    } catch (err) {
+      toast(err.message, "bad");
+    } finally {
+      busy(btn, false);
+    }
+  });
+});
+
+/* -- install job log ---------------------------------------------------- */
+
+function adoptJob(job, { resetCursor = false } = {}) {
+  if (!job) return;
+  const box = el("sys-joblog");
+  if (resetCursor) {
+    state.jobCursor = 0;
+    box.textContent = "";
+  }
+  if (job.lines?.length) {
+    box.textContent += (box.textContent ? "\n" : "") + job.lines.join("\n");
+    box.scrollTop = box.scrollHeight;
+  }
+  state.jobCursor = job.next_cursor ?? state.jobCursor;
+  state.sys.job = job;
+
+  const chip = el("sys-job-state");
+  const label = { running: "进行中", done: "完成", failed: "失败" }[job.state] || job.state;
+  chip.className = `chip ${job.state === "done" ? "chip--on" : job.state === "failed" ? "chip--bad" : ""}`;
+  chip.innerHTML = `${icon(job.state === "running" ? "loader-circle" : job.state === "done" ? "check" : "triangle-alert",
+    job.state === "running" ? "ic--spin" : "")}<span>${escapeHtml(`${label} · ${job.elapsed}s`)}</span>`;
+
+  if (job.state !== "running") {
+    stopJobPolling();
+    if (job.state === "done") {
+      const r = job.result || {};
+      toast(`安装完成: ${r.from || "?"} → ${r.to || "?"}${
+        r.healthz_ok === false ? "（网关健康检查未通过）" : ""}`, r.healthz_ok === false ? "warn" : "ok");
+    } else {
+      toast(`安装失败: ${job.error || "未知错误"}`, "bad");
+    }
+    // The version readout and the link state both changed underneath us.
+    loadSystem();
+    refreshState();
+  }
+}
+
+function startJobPolling() {
+  stopJobPolling();
+  state.jobPoll = setInterval(async () => {
+    try {
+      const data = await api(`/api/opensquilla/job?since=${state.jobCursor}`);
+      if (data.job) adoptJob(data.job);
+      else stopJobPolling();
+    } catch {
+      // A restart of the console itself kills the job log; stop rather than
+      // spamming the toast rail.
+      stopJobPolling();
+    }
+  }, 1500);
+}
+
+function stopJobPolling() {
+  if (state.jobPoll) {
+    clearInterval(state.jobPoll);
+    state.jobPoll = null;
+  }
+}
+
+/* -- password change (from the system panel, not the forced gate) -------- */
+
+el("btn-pw-save").addEventListener("click", async (event) => {
+  const current = el("pw-current").value;
+  const next = el("pw-new").value;
+  const again = el("pw-new2").value;
+  const user = el("pw-user").value.trim();
+  if (!current || !next) return toast("请填写当前密码和新密码", "bad");
+  if (next !== again) return toast("两次输入的新密码不一致", "bad");
+  const btn = event.currentTarget;
+  try {
+    busy(btn, true);
+    const data = await api("/api/password", {
+      method: "POST",
+      body: JSON.stringify({ current, new_password: next, new_user: user || null }),
+    });
+    state.sys.authInfo = data.auth_info || {};
+    ["pw-current", "pw-new", "pw-new2", "pw-user"].forEach((id) => { el(id).value = ""; });
+    toast("密码已修改，其他设备上的登录已失效", "ok");
+    renderSystem();
+  } catch (err) {
+    toast(err.message, "bad");
+  } finally {
+    busy(btn, false);
+  }
+});
+
+/* ------------------------------------------------- forced password gate */
+
+/* The server rejects every business endpoint until the bootstrap credential is
+   rotated, so this screen is the way forward rather than a decoration. It is
+   rendered over the shell instead of on /login because the rotation needs an
+   authenticated session. */
+
+async function checkMustChange() {
+  try {
+    const auth = await api("/api/auth");
+    state.sys.authInfo = auth.auth_info || state.sys.authInfo || {};
+    const gate = el("pw-gate");
+    if (auth.must_change) {
+      gate.hidden = false;
+      document.body.classList.add("is-gated");
+      el("gate-current").focus();
+      return true;
+    }
+    gate.hidden = true;
+    document.body.classList.remove("is-gated");
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+el("gate-save").addEventListener("click", async (event) => {
+  const current = el("gate-current").value;
+  const next = el("gate-new").value;
+  const again = el("gate-new2").value;
+  const user = el("gate-user").value.trim();
+  const err = el("gate-err");
+  const fail = (msg) => {
+    err.hidden = false;
+    err.textContent = msg;
+  };
+  err.hidden = true;
+  if (!current || !next) return fail("请填写当前密码和新密码");
+  if (next !== again) return fail("两次输入的新密码不一致");
+  const btn = event.currentTarget;
+  try {
+    busy(btn, true);
+    const data = await api("/api/password", {
+      method: "POST",
+      body: JSON.stringify({ current, new_password: next, new_user: user || null }),
+    });
+    state.sys.authInfo = data.auth_info || {};
+    el("pw-gate").hidden = true;
+    document.body.classList.remove("is-gated");
+    toast("初始密码已修改，控制台已解锁", "ok");
+    // Everything was 403 until a moment ago, so load it all now.
+    await refreshState();
+    await loadProviders();
+    await loadModelsFromGateway();
+    connectBridge();
+  } catch (e) {
+    fail(e.message);
+  } finally {
+    busy(btn, false);
+  }
+});
+
+el("gate-logout").addEventListener("click", async () => {
+  await api("/api/logout", { method: "POST" }).catch(() => {});
+  location.replace("/login");
+});
 
 /* ------------------------------------------------------------------- chat */
 
@@ -1356,25 +1742,31 @@ function startField() {
   });
 })();
 
-/* Only offer logout when a password is actually configured, so the rail does
-   not show a dead control on an unauthenticated deployment. */
-(async () => {
+/* Logout is always available — the console is never unauthenticated now. */
+(() => {
   const btn = document.getElementById("btn-logout");
   if (!btn) return;
-  try {
-    const auth = await api("/api/auth");
-    if (!auth.enabled) return;
-    btn.hidden = false;
-    btn.addEventListener("click", async () => {
-      await api("/api/logout", { method: "POST" }).catch(() => {});
-      location.replace("/login");
-    });
-  } catch { /* the api() helper already redirects on 401 */ }
+  btn.hidden = false;
+  btn.addEventListener("click", async () => {
+    await api("/api/logout", { method: "POST" }).catch(() => {});
+    location.replace("/login");
+  });
 })();
 
+/* Boot order matters while a password rotation is owed: the server answers 403
+   on every business endpoint and closes /ws, so firing the usual startup calls
+   would fill the screen with failures that have nothing to do with the actual
+   problem. Check the gate first, and only wire the console up behind it. */
 startField();
-connectBridge();
-refreshState();
-loadProviders();
-addTurn("system", `控制台就绪。测活固定问题：${PROBE_QUESTION}`);
-setInterval(() => { if (!state.streaming) refreshState(); }, 20000);
+(async () => {
+  const gated = await checkMustChange();
+  if (gated) {
+    addTurn("system", "控制台已锁定：请先修改初始密码。");
+    return;
+  }
+  connectBridge();
+  refreshState();
+  loadProviders();
+  addTurn("system", `控制台就绪。测活固定问题：${PROBE_QUESTION}`);
+  setInterval(() => { if (!state.streaming) refreshState(); }, 20000);
+})();

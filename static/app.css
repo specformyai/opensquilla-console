@@ -364,7 +364,7 @@ body {
 .panel.is-live { display: grid; }
 
 .panel--chat { grid-template-columns: minmax(0, 1fr) 320px; }
-.panel--keys, .panel--models { grid-template-columns: minmax(0, 1fr); }
+.panel--keys, .panel--models, .panel--system { grid-template-columns: minmax(0, 1fr); }
 
 @media (max-width: 1180px) {
   .panel--chat { grid-template-columns: minmax(0, 1fr); }
@@ -1765,4 +1765,217 @@ textarea#msg::placeholder { color: var(--dust-dim); }
   .title h1 { font-size: 17px; }
   .readouts { display: none; } /* the status bar under the composer covers it */
   .log { padding-block: 10px; }
+}
+
+/* ============================================================== system panel
+   Version management, gateway control, and the console's own password. Laid
+   out as a two-column card grid on desktop; the log and password cards span
+   both because their content is wide (shell output, four form fields). */
+
+.sysgrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 14px;
+  align-items: start;
+}
+.card--wide { grid-column: 1 / -1; }
+
+.sysacts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 9px;
+  margin-top: 12px;
+}
+.sysacts select {
+  flex: 1 1 190px;
+  min-width: 0;
+}
+
+/* Checkbox rows next to the install controls. The native box is kept (it is
+   already legible on this background) — only the label typography is aligned
+   with the rest of the console. */
+.tick {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  color: var(--dust);
+  cursor: pointer;
+  user-select: none;
+}
+.tick input {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--spec-cyan);
+  cursor: pointer;
+}
+
+/* Explanatory line under a control group. --dust, not --dust-dim: measured at
+   7.22:1 against the panel background versus 3.17:1, and this is real
+   information rather than decoration. */
+.note {
+  margin: 11px 0 0;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.65;
+  letter-spacing: 0.04em;
+  color: var(--dust);
+}
+.note:empty { display: none; }
+.note--hot {
+  padding: 9px 11px;
+  border-radius: 9px;
+  border: 1px solid color-mix(in oklab, var(--spec-amber) 34%, transparent);
+  background: color-mix(in oklab, var(--spec-amber) 11%, transparent);
+  /* Mixing toward white lifts amber-on-amber-wash to ~8:1; the raw token only
+     manages ~4:1 once it sits on its own tinted background. */
+  color: color-mix(in oklab, var(--spec-amber) 62%, white);
+}
+
+/* Streamed subprocess output. Fixed height so a 400-line uv install cannot
+   push the rest of the panel off screen. */
+.joblog {
+  margin: 0;
+  max-height: 320px;
+  overflow: auto;
+  padding: 11px 12px;
+  border: 1px solid var(--ink-300);
+  border-radius: 10px;
+  background: var(--ink-050);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.7;
+  color: var(--dust);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  tab-size: 2;
+}
+.joblog:empty::after {
+  content: "等待输出…";
+  color: var(--dust-dim);
+}
+
+/* Amber chip for "stale but usable" — distinct from --wait, which means
+   "in flight". Both carry an icon so the state is not colour-only (WCAG 1.4.1). */
+.chip--warn {
+  color: color-mix(in oklab, var(--warn) 66%, white);
+  border-color: color-mix(in oklab, var(--warn) 42%, transparent);
+  background: color-mix(in oklab, var(--warn) 12%, transparent);
+}
+
+/* ==================================================== forced password gate
+   Covers the whole shell while the bootstrap credential is still in place.
+   The server independently answers 403 on every other endpoint, so this is
+   the operator's way forward rather than the security boundary itself. */
+
+.gate {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: color-mix(in oklab, var(--ink-000) 88%, transparent);
+  backdrop-filter: blur(9px);
+  animation: veil-in 0.2s ease both;
+}
+.gate[hidden] { display: none; }
+
+/* Nothing behind the gate should scroll while it is up. */
+body.is-gated { overflow: hidden; }
+
+.gate__body {
+  width: min(520px, 100%);
+  max-height: calc(100dvh - 40px);
+  overflow-y: auto;
+  padding: 22px;
+  border: 1px solid color-mix(in oklab, var(--spec-amber) 30%, transparent);
+  border-radius: 17px;
+  background:
+    linear-gradient(150deg, color-mix(in oklab, var(--spec-amber) 8%, transparent), transparent 60%),
+    var(--ink-100);
+  box-shadow: 0 26px 70px color-mix(in oklab, var(--ink-000) 74%, transparent);
+  animation: sheet-in 0.26s var(--spring) both;
+}
+
+.gate__head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.gate__head .ic {
+  flex: 0 0 auto;      /* .ic has no intrinsic size — without this it stretches
+                          to fill the flex row and squeezes the heading */
+  width: 20px;
+  height: 20px;
+  color: var(--spec-amber);
+}
+.gate__head h2 {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.gate__lead {
+  margin: 0 0 16px;
+  font-size: 13px;
+  line-height: 1.75;
+  color: var(--dust);
+}
+
+.forge--gate,
+.forge--pw {
+  grid-template-columns: minmax(0, 1fr);
+  padding: 0;
+  margin: 0;
+  border: 0;
+  background: none;
+}
+.forge--pw {
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  margin-top: 13px;
+}
+
+.gate__rule {
+  margin: 13px 0 0;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  line-height: 1.7;
+  letter-spacing: 0.04em;
+  color: var(--dust);
+}
+
+.gate__acts {
+  display: flex;
+  gap: 10px;
+  margin-top: 17px;
+}
+
+.gate__err {
+  margin: 13px 0 0;
+  padding: 9px 11px;
+  border-radius: 9px;
+  border: 1px solid color-mix(in oklab, var(--bad) 40%, transparent);
+  background: color-mix(in oklab, var(--bad) 13%, transparent);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.6;
+  color: color-mix(in oklab, var(--bad) 60%, white);
+}
+.gate__err[hidden] { display: none; }
+
+/* Phones: single-column cards, and the gate gets the full width. */
+@media (max-width: 860px) {
+  .sysgrid { grid-template-columns: minmax(0, 1fr); }
+  .sysacts select { flex-basis: 100%; }
+  .joblog { max-height: 240px; font-size: 10.5px; }
+  .gate { padding: 12px; }
+  .gate__body { padding: 17px; border-radius: 14px; }
+  /* Four rail buttons instead of three: let them shrink rather than overflow. */
+  .rail__nav .navbtn { min-width: 0; flex: 1 1 0; }
 }

@@ -34,6 +34,10 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+import installer
+from authstore import AuthError, AuthStore
+from model_catalog import ModelCatalog
+
 # --------------------------------------------------------------------------
 # Configuration
 # --------------------------------------------------------------------------
@@ -43,6 +47,9 @@ STATIC_DIR = BASE_DIR / "static"
 ICON_DIR = STATIC_DIR / "icon"
 DATA_DIR = Path(os.environ.get("SQUILLA_CONSOLE_DATA", BASE_DIR / "data"))
 KEYS_FILE = DATA_DIR / "keys.json"
+# Model catalogue cache. On disk rather than in memory so a restart (or a
+# deploy) does not leave the UI with an empty catalogue until the next refresh.
+MODELS_CACHE_FILE = DATA_DIR / "models_cache.json"
 
 GATEWAY_WS = os.environ.get("SQUILLA_GATEWAY_WS", "ws://127.0.0.1:18791/ws")
 GATEWAY_HTTP = os.environ.get("SQUILLA_GATEWAY_HTTP", "http://127.0.0.1:18791")
@@ -58,9 +65,6 @@ RPC_TIMEOUT = 180.0
 # `client_ws_keepalive_timeout` seconds (default 120). Ping at well under half
 # that so a single lost frame cannot trip the deadline.
 KEEPALIVE_INTERVAL = 45.0
-
-# Last non-empty model catalogue, replayed when an upstream 503 empties a read.
-_models_cache: dict[str, Any] = {}
 
 # Provider ids the gateway will accept in `onboarding.provider.configure`.
 # A stored credential whose `provider` is not in this set fails activation with
@@ -129,8 +133,14 @@ async def validate_provider_id(provider: str | None) -> None:
 # reachable unauthenticated. The password is supplied out of band; only its
 # hash is compared, and sessions live in memory so a restart logs everyone out.
 
-AUTH_PASSWORD = os.environ.get("SQUILLA_CONSOLE_PASSWORD", "")
-AUTH_USER = os.environ.get("SQUILLA_CONSOLE_USER", "operator")
+# The password used to live only in a systemd drop-in, which made it read-only
+# at runtime: rotating it meant editing a unit file over SSH. It now lives in a
+# 0600 JSON store under the data dir, so the operator can rotate it from the UI
+# — and *must*, because a freshly installed console starts with `must_change`
+# set. The env var is still honoured, but only as the first-boot seed.
+AUTH_FILE = DATA_DIR / "auth.json"
+ENV_PASSWORD = os.environ.get("SQUILLA_CONSOLE_PASSWORD", "")
+ENV_USER = os.environ.get("SQUILLA_CONSOLE_USER", "operator")
 SESSION_COOKIE = "squilla_session"
 SESSION_TTL = 12 * 3600
 # Brute-force damping: a wrong password costs an escalating delay per client.
@@ -150,18 +160,34 @@ PUBLIC_PATHS = frozenset({"/login", "/api/login", "/api/auth", "/healthz"})
 # session exists, and an app icon reveals nothing.
 PUBLIC_PREFIXES = ("/icon/", "/favicon.ico", "/apple-touch-icon")
 
+# While a rotation is owed, an authenticated session may only reach these: the
+# shell that renders the blocking screen, the state probe it reads, the rotation
+# endpoint itself, and logout. Everything else answers 403 so the bootstrap
+# password cannot drive the API from curl.
+MUST_CHANGE_ALLOWED = frozenset({
+    "/",
+    "/api/auth",
+    "/api/password",
+    "/api/logout",
+    "/healthz",
+})
+
 
 def _auth_enabled() -> bool:
-    return bool(AUTH_PASSWORD)
+    # The store always holds a credential (seeded on first boot), so the console
+    # is never reachable unauthenticated. The old behaviour — no env var meant
+    # no login at all — was a foot-gun for anyone who deployed without reading
+    # the setup notes.
+    return True
 
 
 def _session_secret() -> bytes:
-    """Signing key derived from the configured password.
+    """Signing key derived from the stored password verifier.
 
     Deriving it means a password change invalidates every outstanding session
     for free, and no key material needs to be persisted anywhere.
     """
-    return hashlib.sha256(f"squilla-console-session/{AUTH_PASSWORD}".encode()).digest()
+    return auth.session_secret()
 
 
 def _issue_session() -> str:
@@ -213,14 +239,17 @@ def _client_ip(request: Request) -> str:
 
 
 def _password_ok(candidate: str) -> bool:
-    # compare_digest on the hashes keeps the check constant-time regardless of
-    # how the two strings differ in length.
-    return secrets.compare_digest(
-        hashlib.sha256(candidate.encode()).hexdigest(),
-        hashlib.sha256(AUTH_PASSWORD.encode()).hexdigest(),
-    )
+    # PBKDF2 + constant-time compare, both inside the store.
+    return auth.verify(candidate)
+
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# Seeded on first boot: adopts SQUILLA_CONSOLE_PASSWORD when present, otherwise
+# mints a strong random one and drops it next to the store as
+# `bootstrap-password.txt`. Either way the credential is flagged `must_change`,
+# so the first login has to rotate it before anything else is reachable.
+auth = AuthStore(AUTH_FILE, env_password=ENV_PASSWORD, env_user=ENV_USER)
 
 
 # --------------------------------------------------------------------------
@@ -263,6 +292,15 @@ class KeyStore:
     # -- reads ------------------------------------------------------------
     def raw(self, key_id: str) -> dict[str, Any] | None:
         return next((k for k in self._data["keys"] if k["id"] == key_id), None)
+
+    def all_raw(self) -> list[dict[str, Any]]:
+        """Every stored entry, secrets included — callers stay server-side.
+
+        The model catalogue needs all of them, not just the active one: probing
+        each key on an endpoint is what lets a suspended account fail alone
+        instead of blanking the catalogue.
+        """
+        return [dict(k) for k in self._data["keys"]]
 
     @property
     def active_id(self) -> str | None:
@@ -352,6 +390,11 @@ class KeyStore:
 
 
 store = KeyStore(KEYS_FILE)
+
+# Model catalogue: disk-backed, multi-source, refreshed on a timer. Kept out of
+# the request path — reads answer from cache, refreshes are explicit or
+# scheduled.
+catalog = ModelCatalog(MODELS_CACHE_FILE)
 
 
 # --------------------------------------------------------------------------
@@ -497,6 +540,23 @@ class GatewayLink:
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
 
+    async def reconnect(self, wait_seconds: float = 10.0) -> bool:
+        """Tear the link down and bring it back, waiting for the handshake.
+
+        Needed whenever the gateway process is cycled underneath us (a version
+        upgrade, or an operator-triggered restart): the supervisor would
+        reconnect on its own eventually, but the caller wants to report the
+        outcome rather than leave the UI showing a stale 「连接中」.
+        """
+        await self.stop()
+        self.start()
+        deadline = time.monotonic() + wait_seconds
+        while time.monotonic() < deadline:
+            if self.connected:
+                return True
+            await asyncio.sleep(0.25)
+        return self.connected
+
     async def _supervise(self) -> None:
         backoff = 1.0
         while not self._stop:
@@ -527,7 +587,10 @@ class GatewayLink:
             # hello response, so wait for it explicitly.
             challenge = await self._await_challenge(ws)
 
-            auth = {"token": GATEWAY_TOKEN} if GATEWAY_TOKEN else {}
+            # Named gateway_auth, not auth: the module-level `auth` is the
+            # console's own credential store, and shadowing it here would be a
+            # trap for anyone later adding a permission check to this method.
+            gateway_auth = {"token": GATEWAY_TOKEN} if GATEWAY_TOKEN else {}
             handshake = {
                 "type": "req",
                 "id": "handshake",
@@ -536,7 +599,7 @@ class GatewayLink:
                     "minProtocol": 1,
                     "maxProtocol": 3,
                     "role": "operator",
-                    "auth": auth,
+                    "auth": gateway_auth,
                     "nonce": challenge.get("nonce"),
                     "client": {
                         "id": "squilla-console",
@@ -914,6 +977,20 @@ async def require_session(request: Request, call_next: Any) -> Any:
         return await call_next(request)
 
     if _session_valid(request.cookies.get(SESSION_COOKIE)):
+        # A logged-in session still owes a password rotation on a fresh install.
+        # Enforcing that here rather than in the front end means the bootstrap
+        # credential cannot be used to drive the API — hiding the UI behind a
+        # modal would leave every endpoint wide open to a direct curl.
+        if auth.must_change and path not in MUST_CHANGE_ALLOWED:
+            if path.startswith("/api/") or path == "/ws":
+                return JSONResponse(
+                    {"detail": "请先修改初始密码", "must_change": True},
+                    status_code=403,
+                )
+            if not path.startswith("/static/"):
+                # The shell itself is allowed through: it renders the blocking
+                # rotation screen using the assets below.
+                return RedirectResponse("/", status_code=302)
         return await call_next(request)
 
     # XHR and asset requests get a status they can act on; a browser asking for
@@ -931,27 +1008,29 @@ class LoginPayload(BaseModel):
 
 @app.get("/login")
 async def login_page() -> Any:
-    if not _auth_enabled():
-        return RedirectResponse("/", status_code=302)
     return FileResponse(STATIC_DIR / "login.html", headers={"cache-control": "no-store"})
 
 
 @app.get("/api/auth")
 async def api_auth(request: Request) -> JSONResponse:
-    """Let the front end tell 'no auth configured' from 'not logged in'."""
-    return JSONResponse({
-        "enabled": _auth_enabled(),
-        "authenticated": (not _auth_enabled())
-        or _session_valid(request.cookies.get(SESSION_COOKIE)),
-        "user": AUTH_USER,
-    })
+    """Report session state plus whether a password rotation is still owed."""
+    authenticated = _session_valid(request.cookies.get(SESSION_COOKIE))
+    payload = {
+        "enabled": True,
+        "authenticated": authenticated,
+        "user": auth.user,
+        # Drives the forced-rotation screen. Exposed pre-login too, so the login
+        # form can warn that a change will be required, but it leaks nothing:
+        # it is a boolean about this install, not about any credential.
+        "must_change": auth.must_change,
+    }
+    if authenticated:
+        payload["auth_info"] = auth.public()
+    return JSONResponse(payload)
 
 
 @app.post("/api/login")
 async def api_login(payload: LoginPayload, request: Request) -> JSONResponse:
-    if not _auth_enabled():
-        return JSONResponse({"ok": True, "note": "未启用登录"})
-
     client = _client_ip(request)
     state = _login_fails.get(client) or [0.0, 0.0]
     now = time.time()
@@ -974,7 +1053,14 @@ async def api_login(payload: LoginPayload, request: Request) -> JSONResponse:
 
     _login_fails.pop(client, None)
     token = _issue_session()
-    response = JSONResponse({"ok": True})
+    # The front end needs to know immediately that this session is only good for
+    # rotating the password, so it can show the blocking screen instead of a
+    # console whose every call would answer 403.
+    response = JSONResponse({
+        "ok": True,
+        "must_change": auth.must_change,
+        "user": auth.user,
+    })
     response.set_cookie(
         SESSION_COOKIE,
         token,
@@ -999,9 +1085,166 @@ async def api_logout(request: Request) -> JSONResponse:
     return response
 
 
+class PasswordPayload(BaseModel):
+    current: str = Field(min_length=1)
+    new_password: str = Field(min_length=1)
+    # Optional: the operator may rename the account at the same time. Left out,
+    # the existing name is kept.
+    new_user: str | None = None
+
+
+@app.post("/api/password")
+async def api_password(payload: PasswordPayload, request: Request) -> JSONResponse:
+    """Rotate the console credential, re-checking the current password first.
+
+    The rotation is what clears `must_change`, so this is the only write a
+    freshly installed console will accept. Because the session signing key is
+    derived from the stored verifier, every outstanding cookie — including other
+    browsers holding the bootstrap session — dies the moment this succeeds; the
+    caller is handed a fresh one so it is not logged out of its own rotation.
+    """
+    client = _client_ip(request)
+    state = _login_fails.get(client) or [0.0, 0.0]
+    now = time.time()
+    if state[1] > now:
+        wait = int(state[1] - now)
+        return JSONResponse(
+            {"ok": False, "detail": f"尝试次数过多，请 {wait} 秒后再试"},
+            status_code=429,
+        )
+
+    try:
+        info = auth.change(
+            current=payload.current,
+            new_password=payload.new_password,
+            new_user=(payload.new_user or None),
+        )
+    except AuthError as exc:
+        # A wrong *current* password here is a guessing attempt against a live
+        # session, so it feeds the same lockout counter as the login form.
+        if "当前密码" in str(exc):
+            state[0] += 1
+            if state[0] >= LOGIN_LOCK_AFTER:
+                state[1] = now + LOGIN_LOCK_SECONDS
+                state[0] = 0.0
+            _login_fails[client] = state
+            await asyncio.sleep(1.0)
+            return JSONResponse({"ok": False, "detail": str(exc)}, status_code=401)
+        return JSONResponse({"ok": False, "detail": str(exc)}, status_code=400)
+
+    _login_fails.pop(client, None)
+    response = JSONResponse({"ok": True, "auth_info": info})
+    response.set_cookie(
+        SESSION_COOKIE,
+        _issue_session(),
+        max_age=SESSION_TTL,
+        httponly=True,
+        samesite="lax",
+        secure=request.url.scheme == "https"
+        or request.headers.get("x-forwarded-proto") == "https",
+        path="/",
+    )
+    return response
+
+
 @app.get("/healthz")
 async def healthz() -> JSONResponse:
     return JSONResponse({"ok": True})
+
+
+# --------------------------------------------------------------------------
+# OpenSquilla install / upgrade
+# --------------------------------------------------------------------------
+# The gateway this console drives is an ordinary uv tool install, so the console
+# can manage its version too. Two facts shape the whole feature and are easy to
+# get wrong:
+#
+#   * The wheel lives on GitHub Releases, not PyPI. PyPI's `opensquilla` stops
+#     at 0.3.0 while releases are at 0.5.x, so installing "the latest from PyPI"
+#     would silently *downgrade* a working install. See installer.wheel_url.
+#   * Replacing the tool environment while the gateway runs leaves the old
+#     process executing deleted files, so the swap is stop → install → start.
+
+
+class InstallPayload(BaseModel):
+    # Explicit version rather than a "latest" flag: the operator sees which
+    # version they are getting, and a resolver blip cannot silently install
+    # something else.
+    version: str = Field(min_length=1)
+    extras: list[str] | None = None
+    restart_gateway: bool = True
+
+
+@app.get("/api/opensquilla")
+async def api_opensquilla() -> JSONResponse:
+    """Installed version, layout, and whether a newer release exists."""
+    info = await installer.current_version()
+    update = await installer.check_update()
+    return JSONResponse({
+        "current": info,
+        "update": update,
+        "layout": installer.layout(),
+        "extras": installer.installed_extras(),
+        "job": runner_snapshot(),
+    })
+
+
+@app.get("/api/opensquilla/releases")
+async def api_opensquilla_releases(limit: int = 20) -> JSONResponse:
+    """Published releases that ship an installable wheel."""
+    try:
+        rows = await installer.releases(limit=limit)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"读取发布列表失败: {type(exc).__name__}: {exc}") from exc
+    return JSONResponse({"releases": rows, "count": len(rows)})
+
+
+@app.post("/api/opensquilla/install")
+async def api_opensquilla_install(payload: InstallPayload) -> JSONResponse:
+    """Kick off an install/upgrade; progress is polled from /api/opensquilla/job."""
+    if installer.runner.busy:
+        raise HTTPException(409, "已有安装任务在运行")
+    try:
+        job = await installer.install_version(
+            payload.version.strip(),
+            extras=payload.extras,
+            restart_gateway=payload.restart_gateway,
+            healthz_url=f"{GATEWAY_HTTP.rstrip('/')}/healthz",
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return JSONResponse({"ok": True, "job": job.snapshot()})
+
+
+@app.get("/api/opensquilla/job")
+async def api_opensquilla_job(since: int = 0) -> JSONResponse:
+    """Incremental log tail. `since` is the cursor from the previous poll."""
+    job = installer.runner.job
+    if job is None:
+        return JSONResponse({"job": None})
+    return JSONResponse({"job": job.snapshot(since=since)})
+
+
+@app.post("/api/opensquilla/gateway/{action}")
+async def api_opensquilla_gateway(action: str) -> JSONResponse:
+    """start / stop / restart / status / reload the managed gateway."""
+    try:
+        result = await installer.gateway_action(action)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    # The console's own link needs to notice the gateway went away and come
+    # back; a reconnect nudge saves the operator a manual refresh.
+    if action in {"start", "restart", "reload"}:
+        with contextlib.suppress(Exception):
+            await link.reconnect()
+    return JSONResponse(result)
+
+
+def runner_snapshot() -> dict[str, Any] | None:
+    job = installer.runner.job
+    return job.snapshot() if job is not None else None
 
 
 class KeyPayload(BaseModel):
@@ -1028,10 +1271,15 @@ class ModelPayload(BaseModel):
 @app.on_event("startup")
 async def _startup() -> None:
     link.start()
+    # Keeps the catalogue warm without anyone clicking anything. The supplier is
+    # a callback so each round reads the credential book and link state as they
+    # are then, not as they were at boot.
+    catalog.start(_catalog_context_async)
 
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
+    await catalog.stop()
     await link.stop()
 
 
@@ -1063,50 +1311,57 @@ async def api_state() -> JSONResponse:
     })
 
 
+def _catalog_context() -> dict[str, Any]:
+    """Everything the catalogue needs for one refresh round, read fresh.
+
+    Credentials and gateway state both change while the process runs (keys get
+    added, the link reconnects), so this is a callback rather than a snapshot
+    captured at startup.
+    """
+    return {
+        "rpc": link.rpc if link.connected else None,
+        "entries": store.all_raw(),
+        "active": store.raw(store.active_id) if store.active_id else None,
+    }
+
+
+async def _catalog_context_async() -> dict[str, Any]:
+    """Async shape of the above, for the background refresher's supplier hook."""
+    return _catalog_context()
+
+
 @app.get("/api/models")
 async def api_models(refresh: int = 0) -> JSONResponse:
-    """Model catalog for the gateway's active provider.
+    """Model catalogue, served from the on-disk cache.
 
-    Upstream `/models` endpoints flap: tokenrhythm.studio was observed
-    answering 503 on three consecutive probes while the gateway's own live
-    catalog still held 13 entries, so `models.list` alternates between a full
-    list and an empty one with `provider_overloaded`. Blanking the catalogue on
-    such a blip is worse than showing slightly stale data, so the last
-    non-empty result is kept and replayed when a fresh read comes back empty.
+    This endpoint is polled by the UI, so it must never wait on the network:
+    reads answer from cache and a refresh is an explicit action. The cache is
+    also multi-source on purpose. It used to be a single read through whichever
+    credential happened to be active, which meant one suspended account
+    (observed: HTTP 403 `ACCOUNT_SUSPENDED`) emptied the whole catalogue even
+    though two other keys on the same endpoint were answering with 20 models.
     """
-    payload = await link.rpc("models.list", None, timeout=60)
-    models = (payload or {}).get("models") or []
-    errors = (payload or {}).get("errors") or []
-
-    if not models:
-        # models.list only reports what the live selector knows. Fall back to
-        # provider-side discovery using the active key's own credentials.
-        active = store.raw(store.active_id) if store.active_id else None
-        if active:
-            with contextlib.suppress(Exception):
-                discovered = await link.rpc(
-                    "onboarding.models.discover",
-                    {
-                        "providerId": active["provider"],
-                        "apiKey": active["api_key"],
-                        "baseUrl": active["base_url"],
-                    },
-                    timeout=60,
-                )
-                for item in (discovered or {}).get("models") or []:
-                    models.append({
-                        "id": item.get("id") or item.get("model") or "",
-                        "name": item.get("name") or item.get("id") or "",
-                        "provider": active["provider"],
-                        "source": "discover",
-                    })
-
-    if models:
-        _models_cache["models"] = models
-        return JSONResponse({"models": models, "errors": errors, "stale": False})
-
-    cached = _models_cache.get("models") or []
-    return JSONResponse({"models": cached, "errors": errors, "stale": bool(cached)})
+    if refresh:
+        ctx = _catalog_context()
+        result = await catalog.refresh(
+            rpc=ctx["rpc"],
+            entries=ctx["entries"],
+            active=ctx["active"],
+            force=True,
+        )
+        return JSONResponse(result)
+    snapshot = catalog.resolve()
+    # First call after a cold start: nothing on disk yet, so do one inline
+    # round rather than handing the UI an empty list it cannot explain.
+    if not snapshot["models"] and not catalog.in_cooldown:
+        ctx = _catalog_context()
+        snapshot = await catalog.refresh(
+            rpc=ctx["rpc"],
+            entries=ctx["entries"],
+            active=ctx["active"],
+            force=False,
+        )
+    return JSONResponse(snapshot)
 
 
 @app.get("/api/models/endpoint")
@@ -1601,13 +1856,8 @@ async def api_routing_feedback(payload: FeedbackPayload) -> JSONResponse:
 
 @app.post("/api/gateway/reconnect")
 async def api_gateway_reconnect() -> JSONResponse:
-    await link.stop()
-    link.start()
-    for _ in range(40):
-        if link.connected:
-            break
-        await asyncio.sleep(0.25)
-    return JSONResponse({"ok": link.connected, "error": link.last_error})
+    ok = await link.reconnect()
+    return JSONResponse({"ok": ok, "error": link.last_error})
 
 
 @app.websocket("/ws")
@@ -1615,7 +1865,13 @@ async def ws_bridge(sock: WebSocket) -> None:
     # An @app.middleware("http") hook never sees the websocket scope, so the
     # session check has to be repeated here or the event stream would be open
     # to anyone.
-    if _auth_enabled() and not _session_valid(sock.cookies.get(SESSION_COOKIE)):
+    if not _session_valid(sock.cookies.get(SESSION_COOKIE)):
+        await sock.close(code=1008)
+        return
+    # Same rule as the HTTP gate: a session that still owes a password rotation
+    # gets no event stream. Without this the bootstrap credential could tap the
+    # live gateway feed while the UI showed only the rotation screen.
+    if auth.must_change:
         await sock.close(code=1008)
         return
     await sock.accept()
