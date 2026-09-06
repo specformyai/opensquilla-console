@@ -1180,7 +1180,7 @@ async def api_opensquilla(refresh: bool = False) -> JSONResponse:
     """Installed version, layout, and whether a newer release exists.
 
     Served from the background-refreshed cache so the panel can load itself on
-    boot; `?refresh=1` forces the ~15s subprocess round-trip.
+    boot; `?refresh=1` also bypasses the hourly release cache.
     """
     snap = await installer.snapshot(force=refresh)
     return JSONResponse(snap | {"job": runner_snapshot()})
@@ -1282,9 +1282,7 @@ async def _startup() -> None:
     # a callback so each round reads the credential book and link state as they
     # are then, not as they were at boot.
     catalog.start(_catalog_context_async)
-    # Same idea for the version/gateway snapshot: building it costs three CLI
-    # round-trips, so it is kept warm in the background and the panel reads it
-    # from memory instead of making the operator click "refresh".
+    # Warm runtime status automatically; release discovery has its own TTL.
     installer.start_snapshot_refresh()
 
 

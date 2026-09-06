@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import json
 import os
 import re
@@ -43,6 +44,7 @@ import shutil
 import time
 import urllib.error
 import urllib.request
+from importlib.metadata import Distribution
 from pathlib import Path
 from typing import Any
 
@@ -287,6 +289,65 @@ def tool_env() -> dict[str, str]:
     return env
 
 
+def resolve_bin(name: str = "") -> str:
+    """Absolute path of a managed executable, or "" when it is not installed.
+
+    `shutil.which` searches the console's own PATH, but uv puts the launcher in
+    UV_TOOL_BIN_DIR, which is usually not on it — a plain lookup then reports an
+    installed runtime as missing. Searching tool_env()'s PATH keeps discovery
+    consistent with how the command is actually executed. which() also demands
+    the executable bit, so an explicit path falls back to an is_file() check.
+    """
+    target = name or OS_BIN
+    found = shutil.which(target, path=tool_env()["PATH"])
+    if found:
+        return found
+    path = Path(target).expanduser()
+    # Only for a path; a bare name must not match a file in the cwd.
+    return str(path) if path.name != target and path.is_file() else ""
+
+
+def _shebang_root(launcher: Path) -> Path | None:
+    """Tool environment a copied launcher points at, read from its shebang."""
+    with contextlib.suppress(OSError):
+        with launcher.open("rb") as fh:
+            first = fh.readline(512)
+        if not first.startswith(b"#!"):
+            return None
+        parts = first[2:].decode("utf-8", "replace").strip().split()
+        if not parts:
+            return None
+        interpreter = Path(parts[-1] if parts[0].endswith("env") else parts[0])
+        if interpreter.is_absolute() and interpreter.name.startswith("python"):
+            return interpreter.parent.parent
+    return None
+
+
+def _runtime_roots() -> list[Path]:
+    """Candidate tool-environment roots, most authoritative first.
+
+    uv either symlinks the launcher into the tool environment or copies it, and
+    a copy carries no path back to that environment — only its shebang does.
+    Each candidate is a cheap glob, so all of them are tried instead of assuming
+    one install shape.
+    """
+    roots: list[Path] = []
+
+    def add(path: Path | None) -> None:
+        if path is not None and path not in roots:
+            roots.append(path)
+
+    tool_dir = tool_env().get("UV_TOOL_DIR", "").strip()
+    if tool_dir:
+        add(Path(tool_dir).expanduser() / "opensquilla")
+    launcher = resolve_bin()
+    if launcher:
+        path = Path(launcher)
+        add(path.resolve().parent.parent)
+        add(_shebang_root(path))
+    return roots
+
+
 def layout() -> dict[str, Any]:
     """Report where the managed runtime lives, for display and preflight."""
     env = tool_env()
@@ -388,31 +449,48 @@ async def fetch_json(url: str, timeout: float = 20.0) -> Any:
 # --------------------------------------------------------------------------
 
 
+def installed_version() -> str:
+    """Read the managed environment, never import or start its CLI."""
+    versions: set[str] = set()
+    for root in _runtime_roots():
+        for pattern in ("lib/python*/site-packages", "lib/python*/dist-packages", "Lib/site-packages"):
+            for site in root.glob(pattern):
+                for dist in site.glob("opensquilla-*.dist-info"):
+                    metadata = Distribution.at(dist).metadata
+                    if metadata.get("Name", "").lower() == "opensquilla":
+                        value = metadata.get("Version", "").strip()
+                        if value:
+                            versions.add(value)
+        # Two dist-info directories in one environment is a broken install and
+        # must be reported; a later candidate simply describes the same runtime.
+        if versions:
+            break
+    if len(versions) > 1:
+        raise ValueError("multiple installed OpenSquilla versions")
+    return next(iter(versions), "")
+
+
 async def current_version() -> dict[str, Any]:
-    """Installed version, plus whether the gateway is up."""
-    ver = await run_capture([OS_BIN, "version", "--json"], timeout=60)
-    version = ""
-    if ver["rc"] == 0:
-        with contextlib.suppress(Exception):
-            version = (json.loads(ver["stdout"]) or {}).get("version") or ""
-    if not version:
-        # `version --json` is only present on newer builds; fall back to the
-        # dist-info directory name, which exists for any wheel install.
-        tool_dir = layout().get("tool_dir") or ""
-        if tool_dir:
-            root = Path(tool_dir) / "opensquilla"
-            for found in root.rglob("opensquilla-*.dist-info"):
-                m = re.search(r"opensquilla-([0-9][^/]*)\.dist-info$", str(found))
-                if m:
-                    version = m.group(1)
-                    break
-    status = await run_capture([OS_BIN, "gateway", "status"], timeout=45)
-    running = "running" in (status["stdout"] + status["stderr"]).lower()
+    """Installed package metadata and a bounded HTTP liveness check."""
+    error = ""
+    try:
+        version = await asyncio.to_thread(installed_version)
+    except (OSError, ValueError) as exc:
+        version = ""
+        error = f"Installed metadata unavailable: {type(exc).__name__}"
+    url = os.environ.get("SQUILLA_GATEWAY_HTTP", "http://127.0.0.1:18791")
+    running = False
+    try:
+        health = await fetch_json(f"{url.rstrip('/')}/healthz", timeout=3.0)
+        running = isinstance(health, dict) and health.get("ok") is True
+        status = "Gateway running (healthz OK)" if running else "Gateway not ready"
+    except Exception as exc:
+        status = f"Gateway unavailable: {type(exc).__name__}"
     return {
         "version": version,
         "gateway_running": running,
-        "gateway_status": (status["stdout"] or status["stderr"]).strip()[:400],
-        "error": (ver["stderr"].strip()[:300] if ver["rc"] != 0 and not version else ""),
+        "gateway_status": status,
+        "error": error,
     }
 
 
@@ -446,14 +524,39 @@ async def releases(limit: int = 20) -> list[dict[str, Any]]:
     return rows
 
 
-async def check_update() -> dict[str, Any]:
-    """Merge the official channel check with the release list.
+UPDATE_TTL_SECONDS = 3600.0
+UPDATE_RETRY_SECONDS = 300.0
+_UPDATE: dict[str, Any] = {"data": None, "at": 0.0}
+_UPDATE_LOCK: asyncio.Lock | None = None
 
-    `version --check` is the vendor's own answer and is cheap, but it reports a
-    version rather than an asset. The release list confirms the matching wheel
-    is downloadable and supplies its size for the preflight. When the manifest
-    is unreachable the release list alone is enough.
-    """
+
+async def channel_release(current: str) -> tuple[str, str]:
+    """Read and validate the vendor's v1 stable or same-line preview manifest."""
+    preview = re.fullmatch(r"(\d+\.\d+\.\d+)rc\d+", current)
+    endpoint = (f"{OSS_ROOT}/releases/channels/preview/{preview.group(1)}.json"
+                if preview else OSS_CHANNEL_STABLE)
+    endpoint = os.environ.get("OPENSQUILLA_UPDATE_CHECK_ENDPOINT", endpoint)
+    payload = await fetch_json(endpoint, timeout=5.0)
+    if not isinstance(payload, dict) or type(payload.get("schemaVersion")) is not int or payload["schemaVersion"] != 1:
+        raise ValueError("unsupported channel manifest")
+    version = payload.get("version")
+    if not isinstance(version, str):
+        raise ValueError("missing channel version")
+    match = re.fullmatch(r"(\d+\.\d+\.\d+)(rc\d+)?", version)
+    if match is None or payload.get("tag") != f"v{version}":
+        raise ValueError("invalid channel version or tag")
+    if payload.get("baseVersion") != match.group(1) or payload.get("prerelease") is not bool(match.group(2)):
+        raise ValueError("invalid channel scope")
+    if (preview and match.group(1) != preview.group(1)) or (not preview and match.group(2)):
+        raise ValueError("release belongs to another channel")
+    release_url = f"https://github.com/{GITHUB_REPO}/releases/tag/v{version}"
+    if payload.get("releaseUrl") != release_url:
+        raise ValueError("invalid release URL")
+    return version, release_url
+
+
+async def _fetch_update(current: str) -> dict[str, Any]:
+    """Discover releases without launching the full OpenSquilla runtime."""
     out: dict[str, Any] = {
         "current": "",
         "latest": "",
@@ -465,26 +568,20 @@ async def check_update() -> dict[str, Any]:
         "latest_wheel_size": 0,
         "source": {},
     }
-    cur = await current_version()
-    out["current"] = cur["version"]
-    out["gateway_running"] = cur["gateway_running"]
 
     # Which mirror this host should download from is measured, not assumed; the
     # answer is cached, so this is normally free.
     with contextlib.suppress(Exception):
         out["source"] = await resolve_source()
 
-    official = await run_capture([OS_BIN, "version", "--check", "--json"], timeout=90)
-    if official["rc"] == 0:
-        with contextlib.suppress(Exception):
-            payload = json.loads(official["stdout"]) or {}
-            out["latest"] = payload.get("latest") or ""
-            out["release_url"] = payload.get("releaseUrl") or ""
-            out["channel_disabled"] = bool(payload.get("disabled"))
-            if payload.get("error"):
-                out["channel_error"] = str(payload["error"])[:300]
-    else:
-        out["channel_error"] = (official["stderr"] or "").strip()[:300]
+    disabled = any(os.environ.get(k, "").strip().lower() in {"1", "true", "yes", "on"}
+                   for k in ("OPENSQUILLA_UPDATE_CHECK_DISABLED", "OPENSQUILLA_TELEMETRY_DISABLED"))
+    out["channel_disabled"] = disabled
+    if not disabled:
+        try:
+            out["latest"], out["release_url"] = await channel_release(current)
+        except Exception as exc:
+            out["channel_error"] = f"Channel unavailable: {type(exc).__name__}"
 
     try:
         rows = await releases()
@@ -493,19 +590,53 @@ async def check_update() -> dict[str, Any]:
         newest = (stable or rows)[0]["version"] if (stable or rows) else ""
         # The wheel list wins on "can I install it", so a manifest pointing at
         # a version with no published wheel does not become an install target.
-        if newest and (not out["latest"] or out["latest"] not in {r["version"] for r in rows}):
+        if not out["latest"] or out["latest"] not in {r["version"] for r in rows}:
             out["latest"] = newest
+            out["release_url"] = ""
         for row in rows:
             if row["version"] == out["latest"]:
                 out["latest_wheel_size"] = row["wheel_size"]
                 out["release_url"] = out["release_url"] or row["url"]
                 break
     except Exception as exc:  # noqa: BLE001 - degraded, not fatal
-        out["releases_error"] = f"{type(exc).__name__}: {exc}"[:300]
+        out["releases_error"] = f"Releases unavailable: {type(exc).__name__}"
+    return out
 
-    out["update_available"] = bool(
-        out["latest"] and out["current"] and _newer(out["latest"], out["current"])
-    )
+
+async def check_update(current: dict[str, Any] | None = None, *, force: bool = False) -> dict[str, Any]:
+    """Cache network discovery separately from local runtime status."""
+    global _UPDATE_LOCK
+    cur = current if current is not None else await current_version()
+    preview = re.fullmatch(r"(\d+\.\d+\.\d+)rc\d+", cur["version"])
+    scope = preview.group(1) if preview else "stable"
+    if _UPDATE_LOCK is None:
+        _UPDATE_LOCK = asyncio.Lock()
+    async with _UPDATE_LOCK:
+        cached = _UPDATE["data"] if _UPDATE.get("scope") == scope else None
+        ttl = UPDATE_RETRY_SECONDS if cached and cached.get("releases_error") else UPDATE_TTL_SECONDS
+        if force or cached is None or time.monotonic() - _UPDATE["at"] >= ttl:
+            fresh = await _fetch_update(cur["version"])
+            # An outage must not erase the last known wheel list or candidate.
+            if cached and fresh["releases_error"]:
+                fresh["installable"] = cached["installable"]
+                # The wheel list is the only proof a version can be downloaded.
+                # While that listing is down, a manifest naming a build absent
+                # from the reused list stays unverified and must not be offered
+                # as a target next to an installable set that contradicts it.
+                row = next((r for r in fresh["installable"]
+                            if r["version"] == fresh["latest"]), None)
+                if row is None:
+                    for key in ("latest", "release_url", "latest_wheel_size"):
+                        fresh[key] = cached[key]
+                else:
+                    fresh["latest_wheel_size"] = row["wheel_size"]
+                    fresh["release_url"] = fresh["release_url"] or row["url"]
+            _UPDATE.update(data=fresh, at=time.monotonic(), scope=scope)
+        out = copy.deepcopy(_UPDATE["data"])
+    out.update(current=cur["version"], gateway_running=cur["gateway_running"])
+    with contextlib.suppress(Exception):
+        out["source"] = await resolve_source()
+    out["update_available"] = bool(out["latest"] and out["current"] and _newer(out["latest"], out["current"]))
     return out
 
 
@@ -716,12 +847,8 @@ async def _stream(job: Job, args: list[str], timeout: float = 1800.0) -> int:
 # --------------------------------------------------------------------------
 # Snapshot cache
 # --------------------------------------------------------------------------
-# Assembling the panel's data costs three subprocess round-trips through the
-# opensquilla CLI (measured on the production host: --version 4.4s,
-# version --check 5.3s, gateway status 4.8s) plus a GitHub API call. Serialised
-# behind a click that is ~15s of dead UI, which is why the panel originally
-# waited for a button press. Cache it instead and refresh in the background, so
-# opening the panel paints from memory and the operator never presses anything.
+# Runtime status is cheap and refreshed independently of hourly release checks.
+# Only explicit install/lifecycle actions may launch the managed CLI.
 
 SNAPSHOT_TTL_SECONDS = 120.0
 SNAPSHOT_REFRESH_SECONDS = 90.0
@@ -730,9 +857,9 @@ _SNAP_LOCK: asyncio.Lock | None = None
 _SNAP_TASK: asyncio.Task | None = None
 
 
-async def _build_snapshot() -> dict[str, Any]:
+async def _build_snapshot(*, force_update: bool = False) -> dict[str, Any]:
     info = await current_version()
-    update = await check_update()
+    update = await check_update(info, force=force_update)
     return {
         "current": info,
         "update": update,
@@ -751,15 +878,14 @@ async def snapshot(*, force: bool = False) -> dict[str, Any]:
     if _SNAP_LOCK is None:
         _SNAP_LOCK = asyncio.Lock()
     if _SNAP_LOCK.locked() and _SNAP["data"] is not None and not force:
-        # A refresh is already running: serve the stale copy rather than queue
-        # behind ~15s of subprocess work.
+        # Serve the stale copy rather than queue behind an upstream request.
         return dict(_SNAP["data"]) | {"cached": True, "age": age, "refreshing": True}
 
     async with _SNAP_LOCK:
         age = time.time() - float(_SNAP["at"] or 0)
         if _SNAP["data"] is not None and not force and age < SNAPSHOT_TTL_SECONDS:
             return dict(_SNAP["data"]) | {"cached": True, "age": age}
-        data = await _build_snapshot()
+        data = await _build_snapshot(force_update=force)
         _SNAP["data"] = data
         _SNAP["at"] = time.time()
     return dict(data) | {"cached": False, "age": 0.0}
@@ -780,7 +906,8 @@ async def _snapshot_loop() -> None:
     # it; a failure here must never take the console down.
     while True:
         with contextlib.suppress(Exception):
-            await snapshot(force=True)
+            invalidate_snapshot()
+            await snapshot()
         try:
             await asyncio.sleep(SNAPSHOT_REFRESH_SECONDS)
         except asyncio.CancelledError:
@@ -806,6 +933,40 @@ async def stop_snapshot_refresh() -> None:
 def invalidate_snapshot() -> None:
     """Force the next read to rebuild — call after anything that changes state."""
     _SNAP["at"] = 0.0
+
+
+async def _gateway_live() -> bool:
+    """Whether the gateway answers /healthz — proof its environment is in use."""
+    url = os.environ.get("SQUILLA_GATEWAY_HTTP", "http://127.0.0.1:18791")
+    with contextlib.suppress(Exception):
+        body = await fetch_json(f"{url.rstrip('/')}/healthz", timeout=3.0)
+        return isinstance(body, dict) and body.get("ok") is True
+    return False
+
+
+async def lifecycle_state() -> str:
+    """Authoritative process state, only used before replacing a tool environment."""
+    launcher = resolve_bin()
+    if not launcher:
+        # Without a launcher the state cannot be established, so "nothing is
+        # running" must not be assumed: either installed metadata or a live
+        # /healthz means something holds this environment open, and overwriting
+        # it would pull files out from under a running process.
+        if await asyncio.to_thread(installed_version):
+            raise RuntimeError("Installed runtime has no lifecycle command")
+        if await _gateway_live():
+            raise RuntimeError("Gateway is live but exposes no lifecycle command")
+        return "not_started"
+    res = await run_capture([launcher, "gateway", "status", "--json"], timeout=45)
+    try:
+        state = json.loads(res["stdout"])
+        if res["rc"] != 0 or not isinstance(state, dict) or state.get("ok") is not True:
+            raise ValueError("lifecycle status failed")
+        if state.get("state") not in {"running", "unhealthy", "not_started"}:
+            raise ValueError("gateway is not safely managed")
+        return state["state"]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise RuntimeError("Cannot establish managed gateway state; installation stopped") from exc
 
 
 async def install_version(
@@ -850,10 +1011,17 @@ async def install_version(
         req = requirement(version, extras, source_id)
         job.log(f"需求串: {req}")
 
-        was_running = before["gateway_running"]
-        if was_running and restart_gateway:
+        # Liveness is sufficient for the panel, not for safe file replacement:
+        # an unhealthy gateway may still have the old environment open.
+        state = await lifecycle_state()
+        was_running = state in {"running", "unhealthy"}
+        if was_running and not restart_gateway:
+            raise RuntimeError("Stop the gateway or enable restart before upgrading")
+        if was_running:
             job.log("停止网关（替换 tool 环境前必须停，否则旧进程会跑在被删掉的文件上）")
-            await _stream(job, [OS_BIN, "gateway", "stop"], timeout=180)
+            stopped = await _stream(job, [OS_BIN, "gateway", "stop"], timeout=180)
+            if stopped != 0 or await lifecycle_state() != "not_started":
+                raise RuntimeError("Gateway did not stop; runtime was not replaced")
 
         # --force replaces the existing tool environment in place; without it uv
         # treats an already-installed tool as satisfied and does nothing.
@@ -868,7 +1036,7 @@ async def install_version(
 
         after = await current_version()
         job.log(f"安装后版本: {after['version'] or '读不到'}")
-        if after["version"] and after["version"] != version:
+        if after["version"] != version:
             raise RuntimeError(f"版本核对不符: 期望 {version}，实际 {after['version']}")
 
         started = False
@@ -895,6 +1063,7 @@ async def install_version(
                 healthy = False
                 job.log("!! /healthz 始终未就绪，请查看网关日志")
 
+        invalidate_snapshot()
         return {
             "from": before["version"],
             "to": after["version"],
